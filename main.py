@@ -39,3 +39,20 @@ def users_select(conn=Depends(get_db)):
         "rows": rows,
         "row_count": len(rows),
     }
+
+@app.get("/v1/user-check")
+def user_check(
+    email: str = Query(...),
+    conn=Depends(get_db)
+):
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT user_id FROM users WHERE email = %s;",
+            (email,)
+        )
+        row = cur.fetchone()
+
+    return {
+        "exists": row is not None,
+        "user_id": row[0] if row else None,
+    }
