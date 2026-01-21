@@ -29,6 +29,16 @@ def get_db():
     finally:
         conn.close()
 
+@app.get("/pricing")
+def pricing():
+    # TODO: いま実際に返している pricing をここに戻す
+    return {
+        "seats": [{"seat_limit": 10, "monthly_fee": 10000, "label": ""}],
+        "knowledge_count": [{"value": 1, "monthly_price": 0, "label": "1"}],
+        "search_limit": {"per_user_per_day": 100, "note": ""},
+        "poc": None,
+    }
+    
 @app.get("/v1/debug/users-select")
 def users_select(conn=Depends(get_db)):
     with conn.cursor() as cur:
