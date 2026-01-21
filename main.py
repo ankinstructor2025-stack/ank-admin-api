@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, Query
 import os
 import psycopg2
 
@@ -41,12 +41,18 @@ def users_select(conn=Depends(get_db)):
     }
 
 @app.get("/v1/user-check")
-def users_select(conn=Depends(get_db)):
+def user_check(
+    email: str = Query(...),
+    conn=Depends(get_db)
+):
     with conn.cursor() as cur:
-        cur.execute("SELECT user_id FROM users where email=?;")
-        rows = cur.fetchall()
+        cur.execute(
+            "SELECT user_id FROM users WHERE email = %s;",
+            (email,)
+        )
+        row = cur.fetchone()
 
     return {
-        "rows": rows,
-        "row_count": len(rows),
+        "exists": row is not None,
+        "user_id": row[0] if row else None,
     }
