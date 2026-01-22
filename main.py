@@ -153,13 +153,30 @@ class ContractCreate(BaseModel):
     knowledge_count: int
 
 @router.post("/v1/contract")
-def create_contract(
-    payload: ContractCreate,
-    user_id: str = Query(...),
-    conn=Depends(get_db),
-):
+def create_contract(payload: ContractCreate, conn=Depends(get_db)):
     with conn.cursor() as cur:
-        # contracts 作成
+        # 0) email が別 user に使われていたら止める（unique対策）
+        cur.execute("""
+            SELECT user_id
+            FROM users
+            WHERE email = %s AND user_id <> %s
+            LIMIT 1;
+        """, (payload.email, payload.user_id))
+        row = cur.fetchone()
+        if row:
+            raise HTTPException(status_code=409, detail="email already used by another user")
+
+        # 1) users を作る/更新（FKを通すため先に）
+        cur.execute("""
+            INSERT INTO users (user_id, email, display_name, created_at, last_login_at)
+            VALUES (%s, %s, %s, NOW(), NOW())
+            ON CONFLICT (user_id) DO UPDATE
+              SET email = EXCLUDED.email,
+                  display_name = EXCLUDED.display_name,
+                  last_login_at = NOW();
+        """, (payload.user_id, payload.email, payload.display_name))
+
+        # 2) contracts 作成
         cur.execute("""
             INSERT INTO contracts (status, seat_limit, knowledge_count)
             VALUES ('active', %s, %s)
@@ -167,18 +184,14 @@ def create_contract(
         """, (payload.seat_limit, payload.knowledge_count))
         contract_id = cur.fetchone()[0]
 
-        # user_contracts 作成（自分を admin に）
+        # 3) user_contracts 作成
         cur.execute("""
             INSERT INTO user_contracts (user_id, contract_id, role)
             VALUES (%s, %s, 'admin');
-        """, (user_id, contract_id))
+        """, (payload.user_id, contract_id))
 
     conn.commit()
-
-    return {
-        "contract_id": str(contract_id),
-        "status": "active"
-    }
+    return {"contract_id": str(contract_id), "status": "active"}
 
 @app.get("/v1/debug/users-select")
 def users_select(conn=Depends(get_db)):
