@@ -207,3 +207,5 @@ def user_check(
         "exists": row is not None,
         "user_id": row[0] if row else None,
     }
+
+app.include_router(router)
