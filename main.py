@@ -42,16 +42,64 @@ def get_db():
     finally:
         conn.close()
 
-@app.get("/pricing")
-def pricing():
-    # TODO: いま実際に返している pricing をここに戻す
+@app.get("/v1/pricing")
+def pricing(conn=Depends(get_db)):
+    """
+    pricing_items から pricing を組み立てて返す
+    - item_type='seat'                : value_int=seat_limit, monthly_price=monthly_fee
+    - item_type='knowledge_count'     : value_int=value,     monthly_price=monthly_price
+    - item_type='search_limit_per_user_per_day' : value_int=per_user_per_day
+    - item_type='search_limit_note'   : label=note
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT item_type, value_int, monthly_price, label
+            FROM pricing_items
+            WHERE is_active = TRUE
+            ORDER BY item_type, sort_order, value_int
+            """
+        )
+        rows = cur.fetchall()
+
+    seats = []
+    knowledge_count = []
+    search_limit = {"per_user_per_day": 0, "note": ""}
+
+    for item_type, value_int, monthly_price, label in rows:
+        if item_type == "seat":
+            # monthly_price を seats の monthly_fee として返す
+            seats.append({
+                "seat_limit": int(value_int),
+                "monthly_fee": monthly_price,  # NULLなら「要相談」扱い（admin.js側が対応済み）
+                "label": label or ""
+            })
+
+        elif item_type == "knowledge_count":
+            knowledge_count.append({
+                "value": int(value_int),
+                "monthly_price": int(monthly_price or 0),
+                "label": label or str(value_int)
+            })
+
+        elif item_type == "search_limit_per_user_per_day":
+            # 1ユーザーあたり/日の上限
+            search_limit["per_user_per_day"] = int(value_int or 0)
+
+        elif item_type == "search_limit_note":
+            search_limit["note"] = label or ""
+
+        # それ以外は無視（将来拡張用）
+        else:
+            pass
+
     return {
-        "seats": [{"seat_limit": 10, "monthly_fee": 10000, "label": ""}],
-        "knowledge_count": [{"value": 1, "monthly_price": 0, "label": "1"}],
-        "search_limit": {"per_user_per_day": 100, "note": ""},
+        "seats": seats,
+        "knowledge_count": knowledge_count,
+        "search_limit": search_limit,
         "poc": None,
     }
-    
+
 @app.get("/v1/debug/users-select")
 def users_select(conn=Depends(get_db)):
     with conn.cursor() as cur:
