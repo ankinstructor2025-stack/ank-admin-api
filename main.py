@@ -126,7 +126,7 @@ def get_contract(
         row = cur.fetchone()
 
     if not row:
-        raise HTTPException(status_code=404, detail="contract not found")
+        return {"contract": None}
 
     return {
         "contract_id": row[0],
