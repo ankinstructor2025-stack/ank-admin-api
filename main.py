@@ -155,8 +155,8 @@ class ContractCreate(BaseModel):
 @router.post("/v1/contract")
 def create_contract(
     payload: ContractCreate,
-    user=Depends(get_current_user),  # Firebase UID → users.user_id
-    conn=Depends(get_db)
+    user_id: str = Query(...),
+    conn=Depends(get_db),
 ):
     with conn.cursor() as cur:
         # contracts 作成
@@ -171,7 +171,7 @@ def create_contract(
         cur.execute("""
             INSERT INTO user_contracts (user_id, contract_id, role)
             VALUES (%s, %s, 'admin');
-        """, (user.user_id, contract_id))
+        """, (user_id, contract_id))
 
     conn.commit()
 
