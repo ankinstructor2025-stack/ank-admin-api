@@ -100,6 +100,42 @@ def pricing(conn=Depends(get_db)):
         "poc": None,
     }
 
+@app.get("/v1/contract")
+def get_contract(
+    tenant_id: str = Query(...),
+    conn=Depends(get_db)
+):
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT
+              contract_id,
+              tenant_id,
+              status,
+              seat_limit,
+              knowledge_count,
+              payment_method_configured,
+              current_period_end
+            FROM contracts
+            WHERE tenant_id = %s
+            ORDER BY created_at DESC NULLS LAST, start_at DESC NULLS LAST
+            LIMIT 1
+        """, (tenant_id,))
+        row = cur.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="contract not found")
+
+    return {
+        "contract_id": row[0],
+        "tenant_id": row[1],
+        "status": row[2],
+        "seat_limit": row[3],
+        "knowledge_count": row[4],
+        "payment_method_configured": bool(row[5]),
+        # admin.js は paid_until を見ているので合わせる
+        "paid_until": row[6].date().isoformat() if row[6] else None,
+    }
+
 @app.get("/v1/debug/users-select")
 def users_select(conn=Depends(get_db)):
     with conn.cursor() as cur:
