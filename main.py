@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, Query, HTTPException
+from fastapi import FastAPI, APIRouter, Depends, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timezone
 import os
@@ -144,6 +144,40 @@ def get_contract(
             "my_role": row[6],         # 'admin' / 'member'
             "my_status": row[7],       # 'active' / 'disabled'
         }
+    }
+
+router = APIRouter()
+
+class ContractCreate(BaseModel):
+    seat_limit: int
+    knowledge_count: int
+
+@router.post("/v1/contract")
+def create_contract(
+    payload: ContractCreate,
+    user=Depends(get_current_user),  # Firebase UID → users.user_id
+    conn=Depends(get_db)
+):
+    with conn.cursor() as cur:
+        # contracts 作成
+        cur.execute("""
+            INSERT INTO contracts (status, seat_limit, knowledge_count)
+            VALUES ('active', %s, %s)
+            RETURNING contract_id;
+        """, (payload.seat_limit, payload.knowledge_count))
+        contract_id = cur.fetchone()[0]
+
+        # user_contracts 作成（自分を admin に）
+        cur.execute("""
+            INSERT INTO user_contracts (user_id, contract_id, role)
+            VALUES (%s, %s, 'admin');
+        """, (user.user_id, contract_id))
+
+    conn.commit()
+
+    return {
+        "contract_id": str(contract_id),
+        "status": "active"
     }
 
 @app.get("/v1/debug/users-select")
