@@ -149,6 +149,9 @@ def get_contract(
 router = APIRouter()
 
 class ContractCreate(BaseModel):
+    user_id: str
+    email: str
+    display_name: str | None = None
     seat_limit: int
     knowledge_count: int
 
