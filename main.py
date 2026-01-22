@@ -1,8 +1,21 @@
 from fastapi import FastAPI, Depends, Query
+from fastapi.middleware.cors import CORSMiddleware
 import os
 import psycopg2
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://ankinstructor2025-stack.github.io",  # GitHub Pages
+        "http://localhost:5500",
+        "http://127.0.0.1:5500",
+    ],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],  # Authorization を許可
+)
 
 @app.get("/health")
 def health():
