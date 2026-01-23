@@ -1,5 +1,6 @@
 from fastapi import FastAPI, APIRouter, Depends, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from datetime import datetime, timezone
 import os
 import psycopg2
@@ -7,6 +8,8 @@ import uuid
 from pydantic import BaseModel, EmailStr
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
+import firebase_admin
+from firebase_admin import auth as firebase_auth, credentials as firebase_credentials
 
 app = FastAPI()
 
@@ -25,6 +28,33 @@ app.add_middleware(
 @app.get("/health")
 def health():
     return {"ok": True}
+
+auth_scheme = HTTPBearer(auto_error=False)
+
+def _init_firebase():
+    # Cloud Run では ADC (Application Default Credentials) でOK
+    # ローカルは `gcloud auth application-default login` or サービスアカウントJSONで対応
+    if not firebase_admin._apps:
+        firebase_admin.initialize_app(
+            firebase_credentials.ApplicationDefault(),
+            {"projectId": os.environ.get("FIREBASE_PROJECT_ID") or os.environ.get("GOOGLE_CLOUD_PROJECT")}
+        )
+
+def require_user(
+    cred: HTTPAuthorizationCredentials = Depends(auth_scheme),
+):
+    if not cred or cred.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="missing Authorization: Bearer <idToken>")
+
+    _init_firebase()
+
+    token = cred.credentials
+    try:
+        decoded = firebase_auth.verify_id_token(token)  # 署名検証＋期限検証
+        # decoded には uid が入る。email は入っている場合と無い場合がある
+        return decoded
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"invalid token: {str(e)}")
 
 @app.get("/v1/session")
 def get_session():
@@ -106,10 +136,9 @@ def pricing(conn=Depends(get_db)):
     }
 
 @app.get("/v1/contract")
-def get_contract(
-    user_id: str = Query(...),   # ← Firebase UID（users.user_id と同じ想定）
-    conn=Depends(get_db)
-):
+def get_contract(user=Depends(require_user), conn=Depends(get_db)):
+    user_id = user["uid"]
+
     with conn.cursor() as cur:
         cur.execute("""
             SELECT
@@ -150,13 +179,19 @@ def get_contract(
 
 router = APIRouter()
 
-def require_admin():
-    return {"role": "admin"}
+def require_admin(user=Depends(require_user), conn=Depends(get_db)):
+    user_id = user["uid"]
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT 1
+            FROM user_contracts
+            WHERE user_id = %s AND role = 'admin' AND status = 'active'
+            LIMIT 1
+        """, (user_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=403, detail="admin only")
+    return user
 
-def require_user():
-    # 仮：後で Firebase 検証に置き換える
-    return {"uid": "debug-user"}
-    
 class ContractCreate(BaseModel):
     user_id: str
     email: str
@@ -165,7 +200,13 @@ class ContractCreate(BaseModel):
     knowledge_count: int
 
 @router.post("/v1/contract")
-def create_contract(payload: ContractCreate, conn=Depends(get_db)):
+def create_contract(
+    payload: ContractCreate,
+    user=Depends(require_user),
+    conn=Depends(get_db),
+):
+    user_id = user["uid"]
+
     with conn.cursor() as cur:
         # 0) email が別 user に使われていたら止める（unique対策）
         cur.execute("""
@@ -173,7 +214,7 @@ def create_contract(payload: ContractCreate, conn=Depends(get_db)):
             FROM users
             WHERE email = %s AND user_id <> %s
             LIMIT 1;
-        """, (payload.email, payload.user_id))
+        """, (payload.email, user_id))
         row = cur.fetchone()
         if row:
             raise HTTPException(status_code=409, detail="email already used by another user")
@@ -186,7 +227,7 @@ def create_contract(payload: ContractCreate, conn=Depends(get_db)):
               SET email = EXCLUDED.email,
                   display_name = EXCLUDED.display_name,
                   last_login_at = NOW();
-        """, (payload.user_id, payload.email, payload.display_name))
+        """, (user_id, payload.email, payload.display_name))
 
         # 2) contracts 作成
         cur.execute("""
@@ -200,7 +241,7 @@ def create_contract(payload: ContractCreate, conn=Depends(get_db)):
         cur.execute("""
             INSERT INTO user_contracts (user_id, contract_id, role)
             VALUES (%s, %s, 'admin');
-        """, (payload.user_id, contract_id))
+        """, (user_id, contract_id))
 
     conn.commit()
     return {"contract_id": str(contract_id), "status": "active"}
@@ -299,7 +340,7 @@ def create_invite(payload: InviteCreateIn, conn=Depends(get_db), current_user=De
 
 @app.get("/v1/contracts")
 def list_my_contracts(user=Depends(require_user), conn=Depends(get_db)):
-    user_id = user["uid"]  # ← Firebase UID
+    user_id = user["uid"]  # Firebase UID
 
     with conn.cursor() as cur:
         cur.execute("""
