@@ -293,8 +293,42 @@ def create_invite(payload: InviteCreateIn, conn=Depends(get_db), current_user=De
         "contract_id": payload.contract_id,
     }
 
-app.include_router(router)
+@app.get("/v1/contracts")
+def list_my_contracts(user=Depends(require_user), conn=Depends(get_db)):
+    user_id = user["uid"]  # ← Firebase UID
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT
+              uc.contract_id,
+              uc.role,
+              uc.status AS user_contract_status,
+              c.status  AS contract_status,
+              c.seat_limit,
+              c.knowledge_count,
+              c.current_period_end,
+              c.payment_method_configured,
+              c.created_at
+            FROM user_contracts uc
+            JOIN contracts c ON c.contract_id = uc.contract_id
+            WHERE uc.user_id = %s
+            ORDER BY c.created_at DESC
+        """, (user_id,))
+        rows = cur.fetchall()
+
+    return [
+        {
+            "contract_id": r[0],
+            "role": r[1],
+            "user_contract_status": r[2],
+            "contract_status": r[3],
+            "seat_limit": r[4],
+            "knowledge_count": r[5],
+            "current_period_end": r[6].isoformat() if r[6] else None,
+            "payment_method_configured": r[7],
+            "created_at": r[8].isoformat() if r[8] else None,
+        }
+        for r in rows
+    ]
+
+app.include_router(router)
