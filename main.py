@@ -295,3 +295,6 @@ def create_invite(payload: InviteCreateIn, conn=Depends(get_db), current_user=De
 
 app.include_router(router)
 
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
