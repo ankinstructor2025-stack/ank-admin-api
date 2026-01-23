@@ -7,7 +7,6 @@ import uuid
 from pydantic import BaseModel, EmailStr
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
-import functions_framework
 
 app = FastAPI()
 
@@ -154,6 +153,10 @@ router = APIRouter()
 def require_admin():
     return {"role": "admin"}
 
+def require_user():
+    # 仮：後で Firebase 検証に置き換える
+    return {"uid": "debug-user"}
+    
 class ContractCreate(BaseModel):
     user_id: str
     email: str

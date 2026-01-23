@@ -3,4 +3,3 @@ uvicorn[standard]
 psycopg2-binary
 sendgrid
 email-validator
-functions-framework
