@@ -229,8 +229,6 @@ def user_check(
         "user_id": row[0] if row else None,
     }
 
-app.include_router(router)
-
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "https://ankinstructor2025-stack.github.io/ank-knowledge")  # 招待リンクのベース
 FROM_EMAIL = os.environ.get("INVITE_FROM_EMAIL", "ank.instructor2025@gmail.com")
 
@@ -294,3 +292,6 @@ def create_invite(payload: InviteCreateIn, conn=Depends(get_db), current_user=De
         "email": payload.email,
         "contract_id": payload.contract_id,
     }
+
+app.include_router(router)
+
