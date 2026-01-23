@@ -4,7 +4,9 @@ from datetime import datetime, timezone
 import os
 import psycopg2
 import uuid
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
 
 app = FastAPI()
 
@@ -225,3 +227,67 @@ def user_check(
     }
 
 app.include_router(router)
+
+APP_BASE_URL = os.environ.get("APP_BASE_URL", "https://ankinstructor2025-stack.github.io/ank-knowledge")  # 招待リンクのベース
+FROM_EMAIL = os.environ.get("INVITE_FROM_EMAIL", "ank.instructor2025@gmail.com")
+
+class InviteCreateIn(BaseModel):
+    contract_id: str
+    email: EmailStr
+
+@router.post("/v1/invites")
+def create_invite(payload: InviteCreateIn, conn=Depends(get_db), current_user=Depends(require_admin)):
+    # 1) token発行
+    token = uuid.uuid4().hex  # まずはこれで十分（細かい強度は後で）
+    invite_url = f"{APP_BASE_URL}/invite.html?token={token}"
+
+    # 2) DB保存
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO invites (contract_id, email, token)
+            VALUES (%s, %s, %s)
+            RETURNING invite_id, created_at
+            """,
+            (payload.contract_id, payload.email, token),
+        )
+        row = cur.fetchone()
+    conn.commit()
+
+    invite_id, created_at = row
+
+    # 3) SendGridでメール送信
+    sg_key = os.environ.get("SENDGRID_API_KEY")
+    if not sg_key:
+        raise HTTPException(status_code=500, detail="SENDGRID_API_KEY not set")
+
+    subject = "招待メール：アカウント登録"
+    body = (
+        "次のリンクから登録してください。\n\n"
+        f"{invite_url}\n\n"
+        "このメールに心当たりがない場合は破棄してください。\n"
+    )
+
+    message = Mail(
+        from_email=FROM_EMAIL,
+        to_emails=payload.email,
+        subject=subject,
+        plain_text_content=body,
+    )
+
+    try:
+        sg = SendGridAPIClient(sg_key)
+        res = sg.send(message)
+        # SendGridは成功で 202 が返ることが多い
+        if res.status_code not in (200, 201, 202):
+            raise HTTPException(status_code=502, detail=f"SendGrid error: {res.status_code}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"SendGrid send failed: {str(e)}")
+
+    return {
+        "ok": True,
+        "invite_id": str(invite_id),
+        "created_at": created_at.isoformat(),
+        "email": payload.email,
+        "contract_id": payload.contract_id,
+    }
