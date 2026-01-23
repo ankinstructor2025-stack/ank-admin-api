@@ -7,6 +7,7 @@ import uuid
 from pydantic import BaseModel, EmailStr
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
+import functions_framework
 
 app = FastAPI()
 
