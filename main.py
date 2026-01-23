@@ -234,7 +234,7 @@ FROM_EMAIL = os.environ.get("INVITE_FROM_EMAIL", "ank.instructor2025@gmail.com")
 
 class InviteCreateIn(BaseModel):
     contract_id: str
-    email: EmailStr
+    email: str
 
 @router.post("/v1/invites")
 def create_invite(payload: InviteCreateIn, conn=Depends(get_db), current_user=Depends(require_admin)):
