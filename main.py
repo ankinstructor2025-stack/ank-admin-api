@@ -150,6 +150,9 @@ def get_contract(
 
 router = APIRouter()
 
+def require_admin():
+    return {"role": "admin"}
+
 class ContractCreate(BaseModel):
     user_id: str
     email: str
