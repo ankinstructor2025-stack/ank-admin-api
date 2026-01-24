@@ -338,6 +338,65 @@ def update_contract(
 
 from fastapi import Query, HTTPException
 
+class InviteConsumeIn(BaseModel):
+    token: str
+
+@router.post("/v1/invites/consume")
+def consume_invite(payload: InviteConsumeIn, user=Depends(require_user), conn=Depends(get_db)):
+    uid = user["uid"]
+    token_email = user.get("email")
+    display_name = user.get("name") or user.get("displayName") or ""
+
+    with conn.cursor() as cur:
+        # 1) token から invite を引く（未使用トークン前提）
+        cur.execute("""
+            SELECT invite_id, contract_id, email
+            FROM invites
+            WHERE token = %s
+            LIMIT 1
+        """, (payload.token,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="invalid invite token")
+
+        invite_id, contract_id, invited_email = row
+
+        # 2) 招待先メールとログイン中メールが一致するならチェック（取れない場合はスキップ）
+        if token_email and invited_email and token_email.lower() != invited_email.lower():
+            raise HTTPException(status_code=403, detail="email mismatch")
+
+        # 3) users upsert
+        cur.execute("""
+            INSERT INTO users (user_id, email, display_name, created_at, last_login_at)
+            VALUES (%s, %s, %s, NOW(), NOW())
+            ON CONFLICT (user_id) DO UPDATE
+            SET
+              email = EXCLUDED.email,
+              display_name = EXCLUDED.display_name,
+              last_login_at = NOW();
+        """, (uid, token_email, display_name))
+
+        # 4) user_contracts を member で upsert（有効化）
+        cur.execute("""
+            INSERT INTO user_contracts (contract_id, user_id, role, status, created_at, updated_at)
+            VALUES (%s, %s, 'member', 'active', NOW(), NOW())
+            ON CONFLICT (contract_id, user_id) DO UPDATE
+            SET
+              role = 'member',
+              status = 'active',
+              updated_at = NOW();
+        """, (contract_id, uid))
+
+        # 5) token を無効化（再利用防止）
+        cur.execute("""
+            UPDATE invites
+            SET token = NULL
+            WHERE invite_id = %s
+        """, (invite_id,))
+
+    conn.commit()
+    return {"ok": True, "contract_id": str(contract_id), "role": "member"}
+
 @router.get("/v1/contracts/members")
 def list_members(
     contract_id: str = Query(...),
