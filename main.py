@@ -36,6 +36,61 @@ def health():
 from fastapi import HTTPException
 from typing import Optional
 
+# =========================================================
+# Firebase Auth
+# =========================================================
+
+auth_scheme = HTTPBearer(auto_error=False)
+
+def _init_firebase():
+    if not firebase_admin._apps:
+        firebase_admin.initialize_app(
+            firebase_credentials.ApplicationDefault(),
+            {"projectId": os.environ.get("FIREBASE_PROJECT_ID") or os.environ.get("GOOGLE_CLOUD_PROJECT")},
+        )
+
+def require_user(
+    cred: HTTPAuthorizationCredentials = Depends(auth_scheme),
+):
+    if not cred or cred.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="missing Authorization: Bearer <idToken>")
+
+    _init_firebase()
+
+    token = cred.credentials
+    try:
+        decoded = firebase_auth.verify_id_token(token)
+        return decoded  # decoded["uid"] が入る
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"invalid token: {str(e)}")
+
+
+# =========================================================
+# DB
+# =========================================================
+
+def get_db():
+    instance = os.environ["INSTANCE_CONNECTION_NAME"]  # project:region:instance
+    dbname = os.environ["DB_NAME"]
+    user = os.environ["DB_USER"]
+    password = os.environ["DB_PASSWORD"]
+
+    conn = psycopg2.connect(
+        host=f"/cloudsql/{instance}",
+        dbname=dbname,
+        user=user,
+        password=password,
+    )
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+# =========================================================
+# Public APIs
+# =========================================================
+
 @app.get("/v1/session")
 def get_session(
     user=Depends(require_user),
@@ -118,61 +173,6 @@ def get_session(
         "role": role,                      # active 契約から推定（無ければ null）
         "contracts": contracts,            # [{contract_id, role, status}, ...]
     }
-
-# =========================================================
-# Firebase Auth
-# =========================================================
-
-auth_scheme = HTTPBearer(auto_error=False)
-
-def _init_firebase():
-    if not firebase_admin._apps:
-        firebase_admin.initialize_app(
-            firebase_credentials.ApplicationDefault(),
-            {"projectId": os.environ.get("FIREBASE_PROJECT_ID") or os.environ.get("GOOGLE_CLOUD_PROJECT")},
-        )
-
-def require_user(
-    cred: HTTPAuthorizationCredentials = Depends(auth_scheme),
-):
-    if not cred or cred.scheme.lower() != "bearer":
-        raise HTTPException(status_code=401, detail="missing Authorization: Bearer <idToken>")
-
-    _init_firebase()
-
-    token = cred.credentials
-    try:
-        decoded = firebase_auth.verify_id_token(token)
-        return decoded  # decoded["uid"] が入る
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=f"invalid token: {str(e)}")
-
-
-# =========================================================
-# DB
-# =========================================================
-
-def get_db():
-    instance = os.environ["INSTANCE_CONNECTION_NAME"]  # project:region:instance
-    dbname = os.environ["DB_NAME"]
-    user = os.environ["DB_USER"]
-    password = os.environ["DB_PASSWORD"]
-
-    conn = psycopg2.connect(
-        host=f"/cloudsql/{instance}",
-        dbname=dbname,
-        user=user,
-        password=password,
-    )
-    try:
-        yield conn
-    finally:
-        conn.close()
-
-
-# =========================================================
-# Public APIs
-# =========================================================
 
 @app.get("/v1/pricing")
 def pricing(conn=Depends(get_db)):
