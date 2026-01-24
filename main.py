@@ -33,10 +33,91 @@ app.add_middleware(
 def health():
     return {"ok": True}
 
-@app.get("/v1/session")
-def get_session():
-    return {"state": "OK"}
+from fastapi import HTTPException
+from typing import Optional
 
+@app.get("/v1/session")
+def get_session(
+    user=Depends(require_user),
+    conn=Depends(get_db),
+):
+    """
+    フロントの分岐用セッション情報。
+    - Firebaseログイン済み（Bearer token 必須）
+    - users に登録済みか
+    - user_contracts の状態（active があるか）
+    """
+    email = (user.get("email") or "").strip()
+    uid = (user.get("uid") or "").strip()
+
+    if not uid:
+        raise HTTPException(status_code=400, detail="no uid in session")
+    if not email:
+        raise HTTPException(status_code=400, detail="no email in session")
+
+    user_exists = False
+    user_id: Optional[str] = None
+    contracts = []
+    has_active_contract = False
+    active_roles = set()
+
+    with conn.cursor() as cur:
+        # users は email で判定（email は unique の想定）
+        cur.execute(
+            """
+            SELECT user_id
+            FROM users
+            WHERE email = %s
+            LIMIT 1;
+            """,
+            (email,),
+        )
+        row = cur.fetchone()
+        if row:
+            user_exists = True
+            user_id = str(row[0])
+
+            # user_contracts を返す（status が active かどうかを見る）
+            cur.execute(
+                """
+                SELECT contract_id, role, status
+                FROM user_contracts
+                WHERE user_id = %s
+                ORDER BY contract_id;
+                """,
+                (user_id,),
+            )
+            rows = cur.fetchall() or []
+            for (contract_id, role, status) in rows:
+                c = {
+                    "contract_id": str(contract_id),
+                    "role": role,
+                    "status": status,
+                }
+                contracts.append(c)
+                if status == "active":
+                    has_active_contract = True
+                    if role:
+                        active_roles.add(role)
+
+    # “いま有効なロール” を1つ返す（必要ならフロントで使える）
+    # admin が1つでも active なら admin 優先、なければ member
+    role = None
+    if "admin" in active_roles:
+        role = "admin"
+    elif "member" in active_roles:
+        role = "member"
+
+    return {
+        "authed": True,
+        "uid": uid,
+        "email": email,
+        "user_exists": user_exists,
+        "user_id": user_id,                # users にいれば入る
+        "has_active_contract": has_active_contract,
+        "role": role,                      # active 契約から推定（無ければ null）
+        "contracts": contracts,            # [{contract_id, role, status}, ...]
+    }
 
 # =========================================================
 # Firebase Auth
@@ -338,65 +419,6 @@ def update_contract(
 
 from fastapi import Query, HTTPException
 
-class InviteConsumeIn(BaseModel):
-    token: str
-
-@router.post("/v1/invites/consume")
-def consume_invite(payload: InviteConsumeIn, user=Depends(require_user), conn=Depends(get_db)):
-    uid = user["uid"]
-    token_email = user.get("email")
-    display_name = user.get("name") or user.get("displayName") or ""
-
-    with conn.cursor() as cur:
-        # 1) token から invite を引く（未使用トークン前提）
-        cur.execute("""
-            SELECT invite_id, contract_id, email
-            FROM invites
-            WHERE token = %s
-            LIMIT 1
-        """, (payload.token,))
-        row = cur.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="invalid invite token")
-
-        invite_id, contract_id, invited_email = row
-
-        # 2) 招待先メールとログイン中メールが一致するならチェック（取れない場合はスキップ）
-        if token_email and invited_email and token_email.lower() != invited_email.lower():
-            raise HTTPException(status_code=403, detail="email mismatch")
-
-        # 3) users upsert
-        cur.execute("""
-            INSERT INTO users (user_id, email, display_name, created_at, last_login_at)
-            VALUES (%s, %s, %s, NOW(), NOW())
-            ON CONFLICT (user_id) DO UPDATE
-            SET
-              email = EXCLUDED.email,
-              display_name = EXCLUDED.display_name,
-              last_login_at = NOW();
-        """, (uid, token_email, display_name))
-
-        # 4) user_contracts を member で upsert（有効化）
-        cur.execute("""
-            INSERT INTO user_contracts (contract_id, user_id, role, status, created_at, updated_at)
-            VALUES (%s, %s, 'member', 'active', NOW(), NOW())
-            ON CONFLICT (contract_id, user_id) DO UPDATE
-            SET
-              role = 'member',
-              status = 'active',
-              updated_at = NOW();
-        """, (contract_id, uid))
-
-        # 5) token を無効化（再利用防止）
-        cur.execute("""
-            UPDATE invites
-            SET token = NULL
-            WHERE invite_id = %s
-        """, (invite_id,))
-
-    conn.commit()
-    return {"ok": True, "contract_id": str(contract_id), "role": "member"}
-
 @router.get("/v1/contracts/members")
 def list_members(
     contract_id: str = Query(...),
@@ -672,20 +694,18 @@ def create_invite(
 class InviteConsumeIn(BaseModel):
     token: str
 
-
 @router.post("/v1/invites/consume")
 def consume_invite(
     payload: InviteConsumeIn,
     user=Depends(require_user),
     conn=Depends(get_db),
 ):
-    """
-    招待トークンを消費して、ログイン中ユーザーを contract に紐づける
-    """
-    uid = user["uid"]
-    token_email = user.get("email")
+    token_email = (user.get("email") or "").strip()
+    if not token_email:
+        raise HTTPException(status_code=400, detail="no email in session")
 
     with conn.cursor() as cur:
+        # 1) token から invite を取得（未使用トークン前提）
         cur.execute(
             """
             SELECT invite_id, contract_id, email
@@ -701,40 +721,42 @@ def consume_invite(
 
         invite_id, contract_id, invited_email = row
 
-        if token_email and invited_email and token_email.lower() != invited_email.lower():
+        # 2) 招待先メールとログイン中メールの一致チェック（必須）
+        if not invited_email or token_email.lower() != invited_email.lower():
             raise HTTPException(status_code=403, detail="email mismatch")
 
-        # users を upsert（user-check が users 参照なのでここで担保）
+        # 3) users は触らない。user_contracts を active にするだけ
+        #    ※ 管理者が事前に users / user_contracts を作っている前提
         cur.execute(
             """
-            INSERT INTO users (user_id, email, display_name, created_at, last_login_at)
-            VALUES (%s, %s, %s, NOW(), NOW())
-            ON CONFLICT (user_id) DO UPDATE
-              SET email = EXCLUDED.email,
-                  last_login_at = NOW();
+            UPDATE user_contracts uc
+            SET status = 'active'
+            FROM users u
+            WHERE u.user_id = uc.user_id
+              AND u.email = %s
+              AND uc.contract_id = %s
             """,
-            (uid, token_email, user.get("name") or ""),
+            (invited_email, contract_id),
         )
 
-        # user_contracts に紐づけ（既にあれば有効化）
+        if cur.rowcount == 0:
+            # user_contracts が事前作成されていない（または email/users が無い）
+            raise HTTPException(
+                status_code=409,
+                detail="user_contracts not precreated for this email/contract",
+            )
+
+        # 4) token を無効化（再利用防止）
         cur.execute(
             """
-            INSERT INTO user_contracts (user_id, contract_id, role, status)
-            VALUES (%s, %s, 'member', 'active')
-            ON CONFLICT (user_id, contract_id) DO UPDATE
-              SET status = 'active';
+            UPDATE invites
+            SET token = NULL
+            WHERE invite_id = %s AND token = %s
             """,
-            (uid, contract_id),
-        )
-
-        # token を無効化（再利用防止）
-        cur.execute(
-            "UPDATE invites SET token = NULL WHERE invite_id = %s",
-            (invite_id,),
+            (invite_id, payload.token),
         )
 
     conn.commit()
-    return {"ok": True, "contract_id": str(contract_id)}
-
+    return {"ok": True, "contract_id": str(contract_id), "role": "member"}
 
 app.include_router(router)
