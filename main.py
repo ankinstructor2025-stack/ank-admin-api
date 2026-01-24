@@ -336,6 +336,49 @@ def update_contract(
     conn.commit()
     return {"ok": True}
 
+class ContractMarkPaidIn(BaseModel):
+    contract_id: str
+
+@router.post("/v1/contracts/mark-paid")
+def mark_paid(
+    payload: ContractMarkPaidIn,
+    user=Depends(require_user),
+    conn=Depends(get_db),
+):
+    """
+    「支払い設定へ」を押したら完了扱いにする（仮）
+    - payment_method_configured = TRUE
+    - start_at が未設定なら NOW() で埋める（利用開始日）
+    """
+    user_id = user["uid"]
+
+    with conn.cursor() as cur:
+        # このユーザーが、その契約の admin か確認（updateと同じ条件）:contentReference[oaicite:2]{index=2}
+        cur.execute("""
+            SELECT 1
+            FROM user_contracts
+            WHERE user_id = %s
+              AND contract_id = %s
+              AND role = 'admin'
+              AND status = 'active'
+            LIMIT 1
+        """, (user_id, payload.contract_id))
+        if not cur.fetchone():
+            raise HTTPException(status_code=403, detail="admin only for this contract")
+
+        # 支払い設定「完了」扱い
+        cur.execute("""
+            UPDATE contracts
+            SET
+              payment_method_configured = TRUE,
+              start_at = COALESCE(start_at, NOW()),
+              updated_at = NOW()
+            WHERE contract_id = %s
+        """, (payload.contract_id,))
+
+    conn.commit()
+    return {"ok": True}
+
 def require_admin(user=Depends(require_user), conn=Depends(get_db)):
     uid = user["uid"]
     with conn.cursor() as cur:
