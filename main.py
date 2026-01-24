@@ -140,37 +140,20 @@ def pricing(conn=Depends(get_db)):
 
 
 @app.get("/v1/contract")
-def get_contract(
-    user=Depends(require_user),
-    conn=Depends(get_db),
-    user_id: str | None = Query(default=None),
-    email: str | None = Query(default=None),
-):
-    """
-    フロント側が ?user_id=...&email=... を付けてくる場合があるので受ける。
-    ただし、決定権は Authorization の uid。
-    一致しない値が来たら止める（事故防止）。
-    """
-    uid = user["uid"]
-
-    if user_id and user_id != uid:
-        raise HTTPException(status_code=403, detail="user_id mismatch")
-
-    # email は token に入っていない場合があるので、送られてきた場合のみ軽くチェック
-    token_email = user.get("email")
-    if email and token_email and email.lower() != token_email.lower():
-        raise HTTPException(status_code=403, detail="email mismatch")
+def get_contract(user=Depends(require_user), conn=Depends(get_db)):
+    user_id = user["uid"]
 
     with conn.cursor() as cur:
-        cur.execute(
-            """
+        cur.execute("""
             SELECT
               c.contract_id,
               c.status,
+              c.start_at,
               c.seat_limit,
               c.knowledge_count,
               c.payment_method_configured,
-              c.current_period_end,
+              c.monthly_amount_yen,
+              c.note,
               uc.role,
               uc.status
             FROM contracts c
@@ -180,9 +163,7 @@ def get_contract(
               AND uc.status = 'active'
             ORDER BY c.created_at DESC NULLS LAST, c.start_at DESC NULLS LAST
             LIMIT 1
-            """,
-            (uid,),
-        )
+        """, (user_id,))
         row = cur.fetchone()
 
     if not row:
@@ -192,40 +173,42 @@ def get_contract(
         "contract": {
             "contract_id": row[0],
             "status": row[1],
-            "seat_limit": row[2],
-            "knowledge_count": row[3],
-            "payment_method_configured": bool(row[4]),
-            "paid_until": row[5].date().isoformat() if row[5] else None,
-            "my_role": row[6],    # 'admin' / 'member'
-            "my_status": row[7],  # 'active' / 'disabled'
+            "start_at": row[2].isoformat() if row[2] else None,
+            "seat_limit": row[3],
+            "knowledge_count": row[4],
+            "payment_method_configured": bool(row[5]),
+            "monthly_amount_yen": row[6],
+            "note": row[7],
+            # 互換用：UIが paid_until を参照しても落ちないように残す（期限管理しないので None）
+            "paid_until": None,
+            "my_role": row[8],
+            "my_status": row[9],
         }
     }
 
-
 @app.get("/v1/contracts")
 def list_my_contracts(user=Depends(require_user), conn=Depends(get_db)):
-    uid = user["uid"]
+    user_id = user["uid"]  # Firebase UID
 
     with conn.cursor() as cur:
-        cur.execute(
-            """
+        cur.execute("""
             SELECT
               uc.contract_id,
               uc.role,
               uc.status AS user_contract_status,
               c.status  AS contract_status,
+              c.start_at,
               c.seat_limit,
               c.knowledge_count,
-              c.current_period_end,
+              c.monthly_amount_yen,
+              c.note,
               c.payment_method_configured,
               c.created_at
             FROM user_contracts uc
             JOIN contracts c ON c.contract_id = uc.contract_id
             WHERE uc.user_id = %s
             ORDER BY c.created_at DESC
-            """,
-            (uid,),
-        )
+        """, (user_id,))
         rows = cur.fetchall()
 
     return [
@@ -234,15 +217,18 @@ def list_my_contracts(user=Depends(require_user), conn=Depends(get_db)):
             "role": r[1],
             "user_contract_status": r[2],
             "contract_status": r[3],
-            "seat_limit": r[4],
-            "knowledge_count": r[5],
-            "current_period_end": r[6].isoformat() if r[6] else None,
-            "payment_method_configured": r[7],
-            "created_at": r[8].isoformat() if r[8] else None,
+            "start_at": r[4].isoformat() if r[4] else None,
+            "seat_limit": r[5],
+            "knowledge_count": r[6],
+            "monthly_amount_yen": r[7],
+            "note": r[8],
+            "payment_method_configured": r[9],
+            "created_at": r[10].isoformat() if r[10] else None,
+            # 互換用：フロントが current_period_end を参照しても落ちないように残す（期限管理しないので None）
+            "current_period_end": None,
         }
         for r in rows
     ]
-
 
 @app.get("/v1/user-check")
 def user_check(
@@ -323,7 +309,8 @@ class ContractCreate(BaseModel):
     display_name: str | None = None
     seat_limit: int
     knowledge_count: int
-
+    monthly_amount_yen: int
+    note: str | None = None
 
 @router.post("/v1/contract")
 def create_contract(
@@ -359,14 +346,36 @@ def create_contract(
             (uid, payload.email, payload.display_name),
         )
 
-        cur.execute(
-            """
-            INSERT INTO contracts (status, seat_limit, knowledge_count)
-            VALUES ('active', %s, %s)
+        cur.execute("""
+            INSERT INTO contracts (
+              status,
+              start_at,
+              seat_limit,
+              knowledge_count,
+              payment_method_configured,
+              monthly_amount_yen,
+              note,
+              created_at,
+              updated_at
+            )
+            VALUES (
+              'active',
+              NOW(),
+              %s,
+              %s,
+              FALSE,
+              %s,
+              %s,
+              NOW(),
+              NOW()
+            )
             RETURNING contract_id;
-            """,
-            (payload.seat_limit, payload.knowledge_count),
-        )
+        """, (
+            payload.seat_limit,
+            payload.knowledge_count,
+            payload.monthly_amount_yen,
+            (payload.note or None),
+        ))
         contract_id = cur.fetchone()[0]
 
         cur.execute(
