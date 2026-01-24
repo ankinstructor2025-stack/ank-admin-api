@@ -641,6 +641,28 @@ def create_invite(
     invite_url = f"{APP_BASE_URL}/invite.html?token={token}"
 
     with conn.cursor() as cur:
+        # users が無ければ作る（保険）
+        cur.execute(
+            """
+            INSERT INTO users (user_id, email, created_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (email) DO NOTHING
+            """,
+            (uuid.uuid4().hex, payload.email),
+        )
+
+        # user_contracts が無ければ作る（保険）
+        cur.execute(
+            """
+            INSERT INTO user_contracts (user_id, contract_id, role, status)
+            SELECT u.user_id, %s, 'member', 'invited'
+            FROM users u
+            WHERE u.email = %s
+            ON CONFLICT DO NOTHING
+            """,
+            (payload.contract_id, payload.email),
+        )
+        
         cur.execute(
             """
             INSERT INTO invites (contract_id, email, token)
