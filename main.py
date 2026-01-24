@@ -1,15 +1,19 @@
 from fastapi import FastAPI, APIRouter, Depends, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from datetime import datetime, timezone
 import os
 import psycopg2
 import uuid
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
 import firebase_admin
 from firebase_admin import auth as firebase_auth, credentials as firebase_credentials
+
+
+# =========================================================
+# App / CORS
+# =========================================================
 
 app = FastAPI()
 
@@ -29,15 +33,22 @@ app.add_middleware(
 def health():
     return {"ok": True}
 
+@app.get("/v1/session")
+def get_session():
+    return {"state": "OK"}
+
+
+# =========================================================
+# Firebase Auth
+# =========================================================
+
 auth_scheme = HTTPBearer(auto_error=False)
 
 def _init_firebase():
-    # Cloud Run では ADC (Application Default Credentials) でOK
-    # ローカルは `gcloud auth application-default login` or サービスアカウントJSONで対応
     if not firebase_admin._apps:
         firebase_admin.initialize_app(
             firebase_credentials.ApplicationDefault(),
-            {"projectId": os.environ.get("FIREBASE_PROJECT_ID") or os.environ.get("GOOGLE_CLOUD_PROJECT")}
+            {"projectId": os.environ.get("FIREBASE_PROJECT_ID") or os.environ.get("GOOGLE_CLOUD_PROJECT")},
         )
 
 def require_user(
@@ -50,15 +61,15 @@ def require_user(
 
     token = cred.credentials
     try:
-        decoded = firebase_auth.verify_id_token(token)  # 署名検証＋期限検証
-        # decoded には uid が入る。email は入っている場合と無い場合がある
-        return decoded
+        decoded = firebase_auth.verify_id_token(token)
+        return decoded  # decoded["uid"] が入る
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"invalid token: {str(e)}")
 
-@app.get("/v1/session")
-def get_session():
-    return {"state": "OK"}
+
+# =========================================================
+# DB
+# =========================================================
 
 def get_db():
     instance = os.environ["INSTANCE_CONNECTION_NAME"]  # project:region:instance
@@ -77,15 +88,13 @@ def get_db():
     finally:
         conn.close()
 
+
+# =========================================================
+# Public APIs
+# =========================================================
+
 @app.get("/v1/pricing")
 def pricing(conn=Depends(get_db)):
-    """
-    pricing_items から pricing を組み立てて返す
-    - item_type='seat'                : value_int=seat_limit, monthly_price=monthly_fee
-    - item_type='knowledge_count'     : value_int=value,     monthly_price=monthly_price
-    - item_type='search_limit_per_user_per_day' : value_int=per_user_per_day
-    - item_type='search_limit_note'   : label=note
-    """
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -103,30 +112,24 @@ def pricing(conn=Depends(get_db)):
 
     for item_type, value_int, monthly_price, label in rows:
         if item_type == "seat":
-            # monthly_price を seats の monthly_fee として返す
             seats.append({
                 "seat_limit": int(value_int),
-                "monthly_fee": monthly_price,  # NULLなら「要相談」扱い（admin.js側が対応済み）
-                "label": label or ""
+                "monthly_fee": monthly_price,  # NULLなら「要相談」
+                "label": label or "",
             })
 
         elif item_type == "knowledge_count":
             knowledge_count.append({
                 "value": int(value_int),
                 "monthly_price": int(monthly_price or 0),
-                "label": label or str(value_int)
+                "label": label or str(value_int),
             })
 
         elif item_type == "search_limit_per_user_per_day":
-            # 1ユーザーあたり/日の上限
             search_limit["per_user_per_day"] = int(value_int or 0)
 
         elif item_type == "search_limit_note":
             search_limit["note"] = label or ""
-
-        # それ以外は無視（将来拡張用）
-        else:
-            pass
 
     return {
         "seats": seats,
@@ -135,12 +138,32 @@ def pricing(conn=Depends(get_db)):
         "poc": None,
     }
 
+
 @app.get("/v1/contract")
-def get_contract(user=Depends(require_user), conn=Depends(get_db)):
-    user_id = user["uid"]
+def get_contract(
+    user=Depends(require_user),
+    conn=Depends(get_db),
+    user_id: str | None = Query(default=None),
+    email: str | None = Query(default=None),
+):
+    """
+    フロント側が ?user_id=...&email=... を付けてくる場合があるので受ける。
+    ただし、決定権は Authorization の uid。
+    一致しない値が来たら止める（事故防止）。
+    """
+    uid = user["uid"]
+
+    if user_id and user_id != uid:
+        raise HTTPException(status_code=403, detail="user_id mismatch")
+
+    # email は token に入っていない場合があるので、送られてきた場合のみ軽くチェック
+    token_email = user.get("email")
+    if email and token_email and email.lower() != token_email.lower():
+        raise HTTPException(status_code=403, detail="email mismatch")
 
     with conn.cursor() as cur:
-        cur.execute("""
+        cur.execute(
+            """
             SELECT
               c.contract_id,
               c.status,
@@ -157,7 +180,9 @@ def get_contract(user=Depends(require_user), conn=Depends(get_db)):
               AND uc.status = 'active'
             ORDER BY c.created_at DESC NULLS LAST, c.start_at DESC NULLS LAST
             LIMIT 1
-        """, (user_id,))
+            """,
+            (uid,),
+        )
         row = cur.fetchone()
 
     if not row:
@@ -171,80 +196,91 @@ def get_contract(user=Depends(require_user), conn=Depends(get_db)):
             "knowledge_count": row[3],
             "payment_method_configured": bool(row[4]),
             "paid_until": row[5].date().isoformat() if row[5] else None,
-            # ついでに返す（UIで使いたくなる）
-            "my_role": row[6],         # 'admin' / 'member'
-            "my_status": row[7],       # 'active' / 'disabled'
+            "my_role": row[6],    # 'admin' / 'member'
+            "my_status": row[7],  # 'active' / 'disabled'
         }
     }
 
-router = APIRouter()
 
-def require_admin(user=Depends(require_user), conn=Depends(get_db)):
-    user_id = user["uid"]
+@app.get("/v1/contracts")
+def list_my_contracts(user=Depends(require_user), conn=Depends(get_db)):
+    uid = user["uid"]
+
     with conn.cursor() as cur:
-        cur.execute("""
-            SELECT 1
-            FROM user_contracts
-            WHERE user_id = %s AND role = 'admin' AND status = 'active'
-            LIMIT 1
-        """, (user_id,))
-        if not cur.fetchone():
-            raise HTTPException(status_code=403, detail="admin only")
-    return user
+        cur.execute(
+            """
+            SELECT
+              uc.contract_id,
+              uc.role,
+              uc.status AS user_contract_status,
+              c.status  AS contract_status,
+              c.seat_limit,
+              c.knowledge_count,
+              c.current_period_end,
+              c.payment_method_configured,
+              c.created_at
+            FROM user_contracts uc
+            JOIN contracts c ON c.contract_id = uc.contract_id
+            WHERE uc.user_id = %s
+            ORDER BY c.created_at DESC
+            """,
+            (uid,),
+        )
+        rows = cur.fetchall()
 
-class ContractCreate(BaseModel):
-    user_id: str
-    email: str
-    display_name: str | None = None
-    seat_limit: int
-    knowledge_count: int
+    return [
+        {
+            "contract_id": r[0],
+            "role": r[1],
+            "user_contract_status": r[2],
+            "contract_status": r[3],
+            "seat_limit": r[4],
+            "knowledge_count": r[5],
+            "current_period_end": r[6].isoformat() if r[6] else None,
+            "payment_method_configured": r[7],
+            "created_at": r[8].isoformat() if r[8] else None,
+        }
+        for r in rows
+    ]
 
-@router.post("/v1/contract")
-def create_contract(
-    payload: ContractCreate,
-    user=Depends(require_user),
+
+@app.get("/v1/user-check")
+def user_check(
+    email: str = Query(...),
     conn=Depends(get_db),
 ):
-    user_id = user["uid"]
-
+    """
+    admin 側が role を欲しがるので、可能なら role も返す。
+    """
     with conn.cursor() as cur:
-        # 0) email が別 user に使われていたら止める（unique対策）
-        cur.execute("""
-            SELECT user_id
-            FROM users
-            WHERE email = %s AND user_id <> %s
-            LIMIT 1;
-        """, (payload.email, user_id))
+        cur.execute(
+            "SELECT user_id FROM users WHERE email = %s;",
+            (email,),
+        )
         row = cur.fetchone()
-        if row:
-            raise HTTPException(status_code=409, detail="email already used by another user")
 
-        # 1) users を作る/更新（FKを通すため先に）
-        cur.execute("""
-            INSERT INTO users (user_id, email, display_name, created_at, last_login_at)
-            VALUES (%s, %s, %s, NOW(), NOW())
-            ON CONFLICT (user_id) DO UPDATE
-              SET email = EXCLUDED.email,
-                  display_name = EXCLUDED.display_name,
-                  last_login_at = NOW();
-        """, (user_id, payload.email, payload.display_name))
+        if not row:
+            return {"exists": False, "user_id": None, "role": None}
 
-        # 2) contracts 作成
-        cur.execute("""
-            INSERT INTO contracts (status, seat_limit, knowledge_count)
-            VALUES ('active', %s, %s)
-            RETURNING contract_id;
-        """, (payload.seat_limit, payload.knowledge_count))
-        contract_id = cur.fetchone()[0]
+        user_id = row[0]
 
-        # 3) user_contracts 作成
-        cur.execute("""
-            INSERT INTO user_contracts (user_id, contract_id, role)
-            VALUES (%s, %s, 'admin');
-        """, (user_id, contract_id))
+        cur.execute(
+            """
+            SELECT role
+            FROM user_contracts
+            WHERE user_id = %s AND status = 'active'
+            LIMIT 1
+            """,
+            (user_id,),
+        )
+        r2 = cur.fetchone()
 
-    conn.commit()
-    return {"contract_id": str(contract_id), "status": "active"}
+    return {
+        "exists": True,
+        "user_id": user_id,
+        "role": r2[0] if r2 else None,
+    }
+
 
 @app.get("/v1/debug/users-select")
 def users_select(conn=Depends(get_db)):
@@ -257,37 +293,115 @@ def users_select(conn=Depends(get_db)):
         "row_count": len(rows),
     }
 
-@app.get("/v1/user-check")
-def user_check(
-    email: str = Query(...),
-    conn=Depends(get_db)
-):
+
+# =========================================================
+# Admin APIs (router)
+# =========================================================
+
+router = APIRouter()
+
+def require_admin(user=Depends(require_user), conn=Depends(get_db)):
+    uid = user["uid"]
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT user_id FROM users WHERE email = %s;",
-            (email,)
+            """
+            SELECT 1
+            FROM user_contracts
+            WHERE user_id = %s AND role = 'admin' AND status = 'active'
+            LIMIT 1
+            """,
+            (uid,),
+        )
+        if not cur.fetchone():
+            raise HTTPException(status_code=403, detail="admin only")
+    return user
+
+
+class ContractCreate(BaseModel):
+    user_id: str
+    email: str
+    display_name: str | None = None
+    seat_limit: int
+    knowledge_count: int
+
+
+@router.post("/v1/contract")
+def create_contract(
+    payload: ContractCreate,
+    user=Depends(require_user),
+    conn=Depends(get_db),
+):
+    uid = user["uid"]
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT user_id
+            FROM users
+            WHERE email = %s AND user_id <> %s
+            LIMIT 1;
+            """,
+            (payload.email, uid),
         )
         row = cur.fetchone()
+        if row:
+            raise HTTPException(status_code=409, detail="email already used by another user")
 
-    return {
-        "exists": row is not None,
-        "user_id": row[0] if row else None,
-    }
+        cur.execute(
+            """
+            INSERT INTO users (user_id, email, display_name, created_at, last_login_at)
+            VALUES (%s, %s, %s, NOW(), NOW())
+            ON CONFLICT (user_id) DO UPDATE
+              SET email = EXCLUDED.email,
+                  display_name = EXCLUDED.display_name,
+                  last_login_at = NOW();
+            """,
+            (uid, payload.email, payload.display_name),
+        )
 
-APP_BASE_URL = os.environ.get("APP_BASE_URL", "https://ankinstructor2025-stack.github.io/ank-knowledge")  # 招待リンクのベース
+        cur.execute(
+            """
+            INSERT INTO contracts (status, seat_limit, knowledge_count)
+            VALUES ('active', %s, %s)
+            RETURNING contract_id;
+            """,
+            (payload.seat_limit, payload.knowledge_count),
+        )
+        contract_id = cur.fetchone()[0]
+
+        cur.execute(
+            """
+            INSERT INTO user_contracts (user_id, contract_id, role, status)
+            VALUES (%s, %s, 'admin', 'active');
+            """,
+            (uid, contract_id),
+        )
+
+    conn.commit()
+    return {"contract_id": str(contract_id), "status": "active"}
+
+
+APP_BASE_URL = os.environ.get(
+    "APP_BASE_URL",
+    "https://ankinstructor2025-stack.github.io/ank-knowledge"
+)
 FROM_EMAIL = os.environ.get("INVITE_FROM_EMAIL", "ank.instructor2025@gmail.com")
+
 
 class InviteCreateIn(BaseModel):
     contract_id: str
     email: str
 
+
 @router.post("/v1/invites")
-def create_invite(payload: InviteCreateIn, conn=Depends(get_db), current_user=Depends(require_admin)):
-    # 1) token発行
-    token = uuid.uuid4().hex  # まずはこれで十分（細かい強度は後で）
+def create_invite(
+    payload: InviteCreateIn,
+    conn=Depends(get_db),
+    current_user=Depends(require_admin),
+):
+    token = uuid.uuid4().hex
     invite_url = f"{APP_BASE_URL}/invite.html?token={token}"
 
-    # 2) DB保存
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -302,7 +416,6 @@ def create_invite(payload: InviteCreateIn, conn=Depends(get_db), current_user=De
 
     invite_id, created_at = row
 
-    # 3) SendGridでメール送信
     sg_key = os.environ.get("SENDGRID_API_KEY")
     if not sg_key:
         raise HTTPException(status_code=500, detail="SENDGRID_API_KEY not set")
@@ -324,7 +437,6 @@ def create_invite(payload: InviteCreateIn, conn=Depends(get_db), current_user=De
     try:
         sg = SendGridAPIClient(sg_key)
         res = sg.send(message)
-        # SendGridは成功で 202 が返ることが多い
         if res.status_code not in (200, 201, 202):
             raise HTTPException(status_code=502, detail=f"SendGrid error: {res.status_code}")
     except Exception as e:
@@ -338,42 +450,73 @@ def create_invite(payload: InviteCreateIn, conn=Depends(get_db), current_user=De
         "contract_id": payload.contract_id,
     }
 
-@app.get("/v1/contracts")
-def list_my_contracts(user=Depends(require_user), conn=Depends(get_db)):
-    user_id = user["uid"]  # Firebase UID
+
+class InviteConsumeIn(BaseModel):
+    token: str
+
+
+@router.post("/v1/invites/consume")
+def consume_invite(
+    payload: InviteConsumeIn,
+    user=Depends(require_user),
+    conn=Depends(get_db),
+):
+    """
+    招待トークンを消費して、ログイン中ユーザーを contract に紐づける
+    """
+    uid = user["uid"]
+    token_email = user.get("email")
 
     with conn.cursor() as cur:
-        cur.execute("""
-            SELECT
-              uc.contract_id,
-              uc.role,
-              uc.status AS user_contract_status,
-              c.status  AS contract_status,
-              c.seat_limit,
-              c.knowledge_count,
-              c.current_period_end,
-              c.payment_method_configured,
-              c.created_at
-            FROM user_contracts uc
-            JOIN contracts c ON c.contract_id = uc.contract_id
-            WHERE uc.user_id = %s
-            ORDER BY c.created_at DESC
-        """, (user_id,))
-        rows = cur.fetchall()
+        cur.execute(
+            """
+            SELECT invite_id, contract_id, email
+            FROM invites
+            WHERE token = %s
+            LIMIT 1
+            """,
+            (payload.token,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="invalid invite token")
 
-    return [
-        {
-            "contract_id": r[0],
-            "role": r[1],
-            "user_contract_status": r[2],
-            "contract_status": r[3],
-            "seat_limit": r[4],
-            "knowledge_count": r[5],
-            "current_period_end": r[6].isoformat() if r[6] else None,
-            "payment_method_configured": r[7],
-            "created_at": r[8].isoformat() if r[8] else None,
-        }
-        for r in rows
-    ]
+        invite_id, contract_id, invited_email = row
+
+        if token_email and invited_email and token_email.lower() != invited_email.lower():
+            raise HTTPException(status_code=403, detail="email mismatch")
+
+        # users を upsert（user-check が users 参照なのでここで担保）
+        cur.execute(
+            """
+            INSERT INTO users (user_id, email, display_name, created_at, last_login_at)
+            VALUES (%s, %s, %s, NOW(), NOW())
+            ON CONFLICT (user_id) DO UPDATE
+              SET email = EXCLUDED.email,
+                  last_login_at = NOW();
+            """,
+            (uid, token_email, user.get("name") or ""),
+        )
+
+        # user_contracts に紐づけ（既にあれば有効化）
+        cur.execute(
+            """
+            INSERT INTO user_contracts (user_id, contract_id, role, status)
+            VALUES (%s, %s, 'member', 'active')
+            ON CONFLICT (user_id, contract_id) DO UPDATE
+              SET status = 'active';
+            """,
+            (uid, contract_id),
+        )
+
+        # token を無効化（再利用防止）
+        cur.execute(
+            "UPDATE invites SET token = NULL WHERE invite_id = %s",
+            (invite_id,),
+        )
+
+    conn.commit()
+    return {"ok": True, "contract_id": str(contract_id)}
+
 
 app.include_router(router)
