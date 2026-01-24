@@ -286,6 +286,56 @@ def users_select(conn=Depends(get_db)):
 
 router = APIRouter()
 
+class ContractUpdateIn(BaseModel):
+    contract_id: str
+    seat_limit: int
+    knowledge_count: int
+    monthly_amount_yen: int
+    note: str | None = None
+
+@router.post("/v1/contracts/update")
+def update_contract(
+    payload: ContractUpdateIn,
+    user=Depends(require_user),
+    conn=Depends(get_db),
+):
+    user_id = user["uid"]
+
+    with conn.cursor() as cur:
+        # 1) このユーザーが、その契約の admin か確認
+        cur.execute("""
+            SELECT 1
+            FROM user_contracts
+            WHERE user_id = %s
+              AND contract_id = %s
+              AND role = 'admin'
+              AND status = 'active'
+            LIMIT 1
+        """, (user_id, payload.contract_id))
+        if not cur.fetchone():
+            raise HTTPException(status_code=403, detail="admin only for this contract")
+
+        # 2) contracts 更新
+        cur.execute("""
+            UPDATE contracts
+            SET
+              seat_limit = %s,
+              knowledge_count = %s,
+              monthly_amount_yen = %s,
+              note = %s,
+              updated_at = NOW()
+            WHERE contract_id = %s
+        """, (
+            payload.seat_limit,
+            payload.knowledge_count,
+            payload.monthly_amount_yen,
+            (payload.note or None),
+            payload.contract_id,
+        ))
+
+    conn.commit()
+    return {"ok": True}
+
 def require_admin(user=Depends(require_user), conn=Depends(get_db)):
     uid = user["uid"]
     with conn.cursor() as cur:
