@@ -690,7 +690,6 @@ def create_invite(
         "contract_id": payload.contract_id,
     }
 
-
 class InviteConsumeIn(BaseModel):
     token: str
 
@@ -700,12 +699,12 @@ def consume_invite(
     user=Depends(require_user),
     conn=Depends(get_db),
 ):
-    token_email = (user.get("email") or "").strip()
-    if not token_email:
-        raise HTTPException(status_code=400, detail="no email in session")
+    # ログインは必須（匿名では実行させない）
+    if not user or not user.get("uid"):
+        raise HTTPException(status_code=401, detail="not signed in")
 
     with conn.cursor() as cur:
-        # 1) token から invite を取得（未使用トークン前提）
+        # 1) token から invite を取得
         cur.execute(
             """
             SELECT invite_id, contract_id, email
@@ -721,12 +720,9 @@ def consume_invite(
 
         invite_id, contract_id, invited_email = row
 
-        # 2) 招待先メールとログイン中メールの一致チェック（必須）
-        if not invited_email or token_email.lower() != invited_email.lower():
-            raise HTTPException(status_code=403, detail="email mismatch")
+        # 2) ※ email mismatch チェックはしない（運用で吸収）
 
-        # 3) users は触らない。user_contracts を active にするだけ
-        #    ※ 管理者が事前に users / user_contracts を作っている前提
+        # 3) 事前作成済みの user_contracts を active にするだけ
         cur.execute(
             """
             UPDATE user_contracts uc
@@ -740,7 +736,6 @@ def consume_invite(
         )
 
         if cur.rowcount == 0:
-            # user_contracts が事前作成されていない（または email/users が無い）
             raise HTTPException(
                 status_code=409,
                 detail="user_contracts not precreated for this email/contract",
