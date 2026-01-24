@@ -627,58 +627,31 @@ APP_BASE_URL = os.environ.get(
 )
 FROM_EMAIL = os.environ.get("INVITE_FROM_EMAIL", "ank.instructor2025@gmail.com")
 
-
 class InviteCreateIn(BaseModel):
     contract_id: str
     email: str
 
-
 @router.post("/v1/invites")
 def create_invite(
-    contract_id: str = Body(...),
-    email: str = Body(...),
+    payload: InviteCreateIn,
     conn=Depends(get_db),
     current_user=Depends(require_admin),
 ):
     token = uuid.uuid4().hex
-    email = email.strip().lower()
     invite_url = f"{APP_BASE_URL}/invite.html?token={token}"
 
     with conn.cursor() as cur:
-        # users が無ければ作る（emailユニーク前提）
-        cur.execute(
-            """
-            INSERT INTO users (user_id, email, created_at)
-            VALUES (%s, %s, NOW())
-            ON CONFLICT (email) DO NOTHING
-            """,
-            (uuid.uuid4().hex, email),
-        )
-
-        # user_contracts が無ければ作る（users から user_id を引く）
-        cur.execute(
-            """
-            INSERT INTO user_contracts (user_id, contract_id, role, status)
-            SELECT u.user_id, %s, 'member', 'invited'
-            FROM users u
-            WHERE u.email = %s
-            ON CONFLICT DO NOTHING
-            """,
-            (contract_id, email),
-        )
-
-        # invites 作成
         cur.execute(
             """
             INSERT INTO invites (contract_id, email, token)
             VALUES (%s, %s, %s)
             RETURNING invite_id, created_at
             """,
-            (contract_id, email, token),
+            (payload.contract_id, payload.email, token),
         )
         row = cur.fetchone()
-
     conn.commit()
+
     invite_id, created_at = row
 
     sg_key = os.environ.get("SENDGRID_API_KEY")
@@ -694,7 +667,7 @@ def create_invite(
 
     message = Mail(
         from_email=FROM_EMAIL,
-        to_emails=email,
+        to_emails=payload.email,
         subject=subject,
         plain_text_content=body,
     )
@@ -711,8 +684,8 @@ def create_invite(
         "ok": True,
         "invite_id": str(invite_id),
         "created_at": created_at.isoformat(),
-        "email": email,
-        "contract_id": contract_id,
+        "email": payload.email,
+        "contract_id": payload.contract_id,
     }
 
 class InviteConsumeIn(BaseModel):
