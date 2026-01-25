@@ -10,7 +10,7 @@ from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
 import firebase_admin
 from firebase_admin import auth as firebase_auth, credentials as firebase_credentials
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from google.cloud import storage
 from google.oauth2 import service_account
@@ -595,63 +595,79 @@ def upload_finalize(
 
     return {"ok": True}
 
+class UploadUrlRequest(BaseModel):
+    contract_id: str
+    kind: str = "dialogue"
+    filename: str
+    content_type: str
+    note: str | None = None
+
 @router.post("/v1/admin/upload-url")
 def create_upload_url(
-    bucket_name: str,
-    tenant_id: str,
-    filename: str,
-    content_type: str,
-) -> dict:
-    """
-    GCS に PUT するための署名付き URL を発行する
-    """
+    req: UploadUrlRequest,
+    user=Depends(require_user),
+    conn=Depends(get_db),
+):
+    # 1) 認証
+    uid = (user.get("uid") or "").strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="no uid in token")
 
-    if not filename:
-        raise HTTPException(status_code=400, detail="filename is required")
+    # 2) 入力
+    contract_id = (req.contract_id or "").strip()
+    if not contract_id:
+        raise HTTPException(status_code=400, detail="contract_id is required")
 
-    # オブジェクトキー（保存先）
-    object_key = f"tenants/{tenant_id}/uploads/{uuid.uuid4()}_{filename}"
+    # 3) 契約 admin チェック
+    require_contract_admin(uid, contract_id, conn)
 
-    # --- ここが重要 ---
-    # Cloud Run に Secret Manager を「ボリューム」としてマウントしている前提
-    # マウントパス: /secrets
-    # パス名     : ank-gcs-signer
-    signer_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or "/secrets/ank-gcs-signer"
+    # 4) 月5件制限（dialogueのみ）
+    mk = month_key_jst()
+    if req.kind == "dialogue":
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT COUNT(*)
+                FROM upload_logs
+                WHERE contract_id = %s
+                  AND kind = 'dialogue'
+                  AND month_key = %s
+            """, (contract_id, mk))
+            cnt = int(cur.fetchone()[0] or 0)
 
-    if not os.path.exists(signer_path):
-        raise HTTPException(
-            status_code=500,
-            detail=f"signer file not found: {signer_path}",
-        )
+        if cnt >= MAX_DIALOGUE_PER_MONTH:
+            raise HTTPException(
+                status_code=409,
+                detail=f"dialogue uploads limit reached: {cnt}/{MAX_DIALOGUE_PER_MONTH} for {mk}"
+            )
 
-    # サービスアカウント鍵を明示的に読む
-    credentials = service_account.Credentials.from_service_account_file(
-        signer_path
-    )
+    # 5) object_key（contracts/ で統一）
+    upload_id = uuid.uuid4()
+    safe_name = (req.filename or "file").replace("/", "_").replace("\\", "_")
+    object_key = f"contracts/{contract_id}/{mk}/{upload_id}_{safe_name}"
 
-    client = storage.Client(credentials=credentials)
-    bucket = client.bucket(bucket_name)
+    # 6) 台帳INSERT（乱発抑止）
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO upload_logs (upload_id, contract_id, kind, object_key, month_key, created_at)
+            VALUES (%s, %s, %s, %s, %s, NOW())
+        """, (str(upload_id), contract_id, req.kind, object_key, mk))
+    conn.commit()
+
+    # 7) 署名URL（ここで500が出るなら、鍵/権限の問題）
+    bucket = storage.Client().bucket(BUCKET_NAME)
     blob = bucket.blob(object_key)
 
-    try:
-        upload_url = blob.generate_signed_url(
-            version="v4",
-            expiration=15 * 60,  # 15分
-            method="PUT",
-            content_type=content_type,
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"failed to generate signed url: {str(e)}",
-        )
+    url = blob.generate_signed_url(
+        version="v4",
+        expiration=timedelta(minutes=15),
+        method="PUT",
+        content_type=req.content_type,
+    )
 
     return {
-        "upload_url": upload_url,
+        "upload_id": str(upload_id),
         "object_key": object_key,
-        "bucket": bucket_name,
-        "method": "PUT",
-        "expires_in": 900,
+        "upload_url": url,
     }
 
 # =========================================================
