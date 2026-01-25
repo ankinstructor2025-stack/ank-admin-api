@@ -9,7 +9,9 @@ from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
 import firebase_admin
 from firebase_admin import auth as firebase_auth, credentials as firebase_credentials
-
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from google.cloud import storage
 
 # =========================================================
 # App / CORS
@@ -362,10 +364,145 @@ def users_select(conn=Depends(get_db)):
 
 
 # =========================================================
+# Upload (GCS Signed URL) settings
+#   ※ ここを「Admin APIs (router)」より前に置く（壊さない最小修正）
+# =========================================================
+
+JST = ZoneInfo("Asia/Tokyo")
+BUCKET_NAME = os.environ.get("UPLOAD_BUCKET", "ank-bucket")
+MAX_DIALOGUE_PER_MONTH = int(os.environ.get("MAX_DIALOGUE_PER_MONTH", "5"))
+
+def month_key_jst() -> str:
+    return datetime.now(tz=JST).strftime("%Y-%m")
+
+def require_contract_admin(uid: str, contract_id: str, conn):
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT 1
+            FROM user_contracts
+            WHERE user_id=%s
+              AND contract_id=%s
+              AND role='admin'
+              AND status='active'
+            LIMIT 1
+        """, (uid, contract_id))
+        if not cur.fetchone():
+            raise HTTPException(status_code=403, detail="admin only for this contract")
+
+
+# =========================================================
 # Admin APIs (router)
 # =========================================================
 
 router = APIRouter()
+
+@router.post("/v1/admin/upload-finalize")
+def upload_finalize(
+    payload: dict,
+    user=Depends(require_user),
+    conn=Depends(get_db),
+):
+    contract_id = (payload.get("contract_id") or "").strip()
+    object_key = (payload.get("object_key") or "").strip()
+    upload_id = (payload.get("upload_id") or "").strip()
+
+    if not contract_id or not object_key or not upload_id:
+        raise HTTPException(status_code=400, detail="contract_id, object_key, upload_id are required")
+
+    uid = (user.get("uid") or "").strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="no uid in token")
+
+    require_contract_admin(uid, contract_id, conn)
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT 1
+            FROM upload_logs
+            WHERE upload_id = %s
+              AND contract_id = %s
+              AND object_key = %s
+            LIMIT 1
+        """, (upload_id, contract_id, object_key))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="upload log not found")
+
+    return {"ok": True}
+
+@router.post("/v1/admin/upload-url")
+def create_upload_url(
+    payload: dict,
+    user=Depends(require_user),
+    conn=Depends(get_db),
+):
+    # ---- 入力（model無しなので最低限チェック） ----
+    contract_id = (payload.get("contract_id") or "").strip()
+    kind = (payload.get("kind") or "dialogue").strip()
+    filename = (payload.get("filename") or "").strip()
+    content_type = (payload.get("content_type") or "application/octet-stream").strip()
+
+    if not contract_id:
+        raise HTTPException(status_code=400, detail="contract_id is required")
+    if not filename:
+        raise HTTPException(status_code=400, detail="filename is required")
+
+    # ---- 契約 admin チェック（契約単位） ----
+    uid = (user.get("uid") or "").strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="no uid in token")
+
+    require_contract_admin(uid, contract_id, conn)
+
+    # ---- 月5件制限（dialogueのみ / JST月） ----
+    mk = month_key_jst()
+
+    if kind == "dialogue":
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT COUNT(*)
+                FROM upload_logs
+                WHERE contract_id = %s
+                  AND kind = 'dialogue'
+                  AND month_key = %s
+            """, (contract_id, mk))
+            cnt = int(cur.fetchone()[0] or 0)
+
+        if cnt >= MAX_DIALOGUE_PER_MONTH:
+            raise HTTPException(
+                status_code=409,
+                detail=f"dialogue uploads limit reached: {cnt}/{MAX_DIALOGUE_PER_MONTH} for {mk}"
+            )
+
+    # ---- object_key 確定（単純版） ----
+    upload_id = uuid.uuid4()
+    safe_name = filename.replace("/", "_").replace("\\", "_")
+    object_key = f"tenants/{contract_id}/{mk}/{upload_id}_{safe_name}"
+
+    # ---- 先に台帳INSERT（乱発抑止/多重クリック耐性） ----
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO upload_logs (upload_id, contract_id, kind, object_key, month_key, created_at)
+            VALUES (%s, %s, %s, %s, %s, NOW())
+        """, (str(upload_id), contract_id, kind, object_key, mk))
+    conn.commit()
+
+    # ---- GCS Signed URL（PUT） ----
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+    blob = bucket.blob(object_key)
+
+    upload_url = blob.generate_signed_url(
+        version="v4",
+        expiration=15 * 60,  # 15分
+        method="PUT",
+        content_type=content_type,
+    )
+
+    return {
+        "upload_id": str(upload_id),
+        "object_key": object_key,
+        "upload_url": upload_url,
+    }
 
 class ContractUpdateIn(BaseModel):
     contract_id: str
@@ -662,7 +799,7 @@ def create_invite(
             """,
             (payload.contract_id, payload.email),
         )
-        
+
         cur.execute(
             """
             INSERT INTO invites (contract_id, email, token)
