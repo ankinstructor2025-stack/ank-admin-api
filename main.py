@@ -19,16 +19,26 @@ from google.cloud import storage
 
 app = FastAPI()
 
+#app.add_middleware(
+#    CORSMiddleware,
+#    allow_origins=[
+#        "https://ankinstructor2025-stack.github.io",  # GitHub Pages
+#        "http://localhost:5500",
+#        "http://127.0.0.1:5500",
+#    ],
+#    allow_credentials=False,
+#    allow_methods=["*"],
+#    allow_headers=["*"],  # Authorization を許可
+#)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://ankinstructor2025-stack.github.io",  # GitHub Pages
-        "http://localhost:5500",
-        "http://127.0.0.1:5500",
+        "https://ankinstructor2025-stack.github.io",
     ],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],  # Authorization を許可
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 @app.options("/{path:path}")
