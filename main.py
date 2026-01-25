@@ -365,7 +365,7 @@ def users_select(conn=Depends(get_db)):
 
 # =========================================================
 # Upload (GCS Signed URL) settings
-#   ※ ここを「Admin APIs (router)」より前に置く（壊さない最小修正）
+#   ※ Admin APIs より前に置く（既存を壊さないため）
 # =========================================================
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -395,6 +395,167 @@ def require_contract_admin(uid: str, contract_id: str, conn):
 # =========================================================
 
 router = APIRouter()
+
+# ---------------------------------------------------------
+# 対話データ（dialogue）一覧
+#   GET /v1/admin/dialogues?contract_id=...
+#   - upload_logs(kind='dialogue') を返す
+#   - contracts.active_dialogue_object_key を返す
+# ---------------------------------------------------------
+@router.get("/v1/admin/dialogues")
+def list_dialogues(
+    contract_id: str = Query(...),
+    user=Depends(require_user),
+    conn=Depends(get_db),
+):
+    uid = (user.get("uid") or "").strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="no uid in token")
+
+    contract_id = (contract_id or "").strip()
+    if not contract_id:
+        raise HTTPException(status_code=400, detail="contract_id is required")
+
+    require_contract_admin(uid, contract_id, conn)
+
+    active_object_key = None
+    items = []
+
+    with conn.cursor() as cur:
+        # 現在有効な対話データ（contracts側）
+        cur.execute("""
+            SELECT active_dialogue_object_key
+            FROM contracts
+            WHERE contract_id = %s
+            LIMIT 1
+        """, (contract_id,))
+        row = cur.fetchone()
+        if row:
+            active_object_key = row[0]
+
+        # upload_logs（対話データのみ）
+        cur.execute("""
+            SELECT upload_id, object_key, month_key, created_at, kind
+            FROM upload_logs
+            WHERE contract_id = %s
+              AND kind = 'dialogue'
+            ORDER BY created_at DESC
+            LIMIT 200
+        """, (contract_id,))
+        rows = cur.fetchall() or []
+
+        for (upload_id, object_key, month_key, created_at, kind) in rows:
+            items.append({
+                "upload_id": str(upload_id),
+                "object_key": object_key,
+                "month_key": month_key,
+                "created_at": created_at.isoformat() if created_at else None,
+                "kind": kind,
+            })
+
+    return {
+        "contract_id": contract_id,
+        "active_object_key": active_object_key,
+        "items": items,
+    }
+
+
+# ---------------------------------------------------------
+# 対話データ（dialogue）有効化（1つ選ぶ）
+#   POST /v1/admin/dialogues/activate
+#   body: { contract_id, object_key }
+# ---------------------------------------------------------
+@router.post("/v1/admin/dialogues/activate")
+def activate_dialogue(
+    payload: dict,
+    user=Depends(require_user),
+    conn=Depends(get_db),
+):
+    contract_id = (payload.get("contract_id") or "").strip()
+    object_key = (payload.get("object_key") or "").strip()
+
+    if not contract_id or not object_key:
+        raise HTTPException(status_code=400, detail="contract_id and object_key are required")
+
+    uid = (user.get("uid") or "").strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="no uid in token")
+
+    require_contract_admin(uid, contract_id, conn)
+
+    # 指定 object_key がこの契約の dialogue として存在するか（保険）
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT 1
+            FROM upload_logs
+            WHERE contract_id = %s
+              AND kind = 'dialogue'
+              AND object_key = %s
+            LIMIT 1
+        """, (contract_id, object_key))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="dialogue object_key not found in upload_logs")
+
+        # 有効化（contracts に 1本だけ持つ）
+        cur.execute("""
+            UPDATE contracts
+            SET active_dialogue_object_key = %s,
+                updated_at = NOW()
+            WHERE contract_id = %s
+        """, (object_key, contract_id))
+
+    conn.commit()
+    return {"ok": True, "contract_id": contract_id, "active_object_key": object_key}
+
+
+# ---------------------------------------------------------
+# QA作成（開始）
+#   POST /v1/admin/dialogues/build-qa
+#   body: { contract_id }
+#   ※ 実体のQA生成は後で実装する前提。ここは「開始できる」だけ。
+# ---------------------------------------------------------
+@router.post("/v1/admin/dialogues/build-qa")
+def build_qa_from_active_dialogue(
+    payload: dict,
+    user=Depends(require_user),
+    conn=Depends(get_db),
+):
+    contract_id = (payload.get("contract_id") or "").strip()
+    if not contract_id:
+        raise HTTPException(status_code=400, detail="contract_id is required")
+
+    uid = (user.get("uid") or "").strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="no uid in token")
+
+    require_contract_admin(uid, contract_id, conn)
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT active_dialogue_object_key
+            FROM contracts
+            WHERE contract_id = %s
+            LIMIT 1
+        """, (contract_id,))
+        row = cur.fetchone()
+        active_key = row[0] if row else None
+
+    if not active_key:
+        raise HTTPException(status_code=409, detail="active dialogue data is not selected")
+
+    # ここではジョブキューなどはまだ持たない（余計な改造をしない）
+    # 「有効な対話データが決まっていて、開始要求が通る」ことだけ保証する
+    return {
+        "ok": True,
+        "contract_id": contract_id,
+        "active_object_key": active_key,
+        "status": "requested",
+    }
+
+
+# =========================================================
+# Upload URLs (Signed URL)
+# =========================================================
 
 @router.post("/v1/admin/upload-finalize")
 def upload_finalize(
@@ -503,6 +664,11 @@ def create_upload_url(
         "object_key": object_key,
         "upload_url": upload_url,
     }
+
+
+# =========================================================
+# Existing Admin APIs
+# =========================================================
 
 class ContractUpdateIn(BaseModel):
     contract_id: str
@@ -628,7 +794,7 @@ def mark_paid(
     user_id = user["uid"]
 
     with conn.cursor() as cur:
-        # このユーザーが、その契約の admin か確認（updateと同じ条件）:contentReference[oaicite:2]{index=2}
+        # このユーザーが、その契約の admin か確認（updateと同じ条件）
         cur.execute("""
             SELECT 1
             FROM user_contracts
