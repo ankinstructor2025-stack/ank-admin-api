@@ -653,8 +653,17 @@ def create_upload_url(
         """, (str(upload_id), contract_id, req.kind, object_key, mk))
     conn.commit()
 
-    # 7) 署名URL（ここで500が出るなら、鍵/権限の問題）
-    bucket = storage.Client().bucket(BUCKET_NAME)
+    # 7) 署名URL（Secret Managerを /secrets にマウントした鍵で署名する）
+    signer_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or "/secrets/ank-gcs-signer"
+
+    # Secret が正しくマウントされていない場合はここで落とす（原因が分かりやすい）
+    if not os.path.exists(signer_path):
+        raise HTTPException(status_code=500, detail=f"signer file not found: {signer_path}")
+
+    credentials = service_account.Credentials.from_service_account_file(signer_path)
+
+    client = storage.Client(credentials=credentials)
+    bucket = client.bucket(BUCKET_NAME)
     blob = bucket.blob(object_key)
 
     url = blob.generate_signed_url(
