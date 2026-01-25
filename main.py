@@ -1,6 +1,7 @@
-from fastapi import FastAPI, APIRouter, Depends, Query, HTTPException
+from fastapi import FastAPI, APIRouter, Depends, Query, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.responses import Response
 import os
 import psycopg2
 import uuid
@@ -12,7 +13,6 @@ from firebase_admin import auth as firebase_auth, credentials as firebase_creden
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from google.cloud import storage
-
 # =========================================================
 # App / CORS
 # =========================================================
@@ -30,6 +30,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],  # Authorization を許可
 )
+
+@app.options("/{path:path}")
+def cors_preflight(path: str, request: Request):
+    # CORSMiddleware が効いていれば、ここは呼ばれない（＝保険）
+    return Response(status_code=204)
 
 @app.get("/health")
 def health():
