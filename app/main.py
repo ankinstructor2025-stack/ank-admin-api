@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
 
-from core.cors import setup_cors
+from app.core.cors import setup_cors
 
 from app.routers.public import router as public_router
 from app.routers.admin_core import router as admin_core_router
