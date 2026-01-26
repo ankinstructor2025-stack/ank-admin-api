@@ -1115,11 +1115,11 @@ class JudgeMethodOut(BaseModel):
 # Helpers
 # -------------------------
 def _gcs_read_head_text(object_key: str, limit_bytes: int) -> str:
-    if not GCS_BUCKET:
-        raise HTTPException(status_code=500, detail="GCS_BUCKET is not set")
+    if not BUCKET_NAME:
+        raise HTTPException(status_code=500, detail="BUCKET_NAME is not set")
 
     client = storage.Client()
-    bucket = client.bucket(GCS_BUCKET)
+    bucket = client.bucket(BUCKET_NAME)
     blob = bucket.blob(object_key)
 
     # download first N bytes
