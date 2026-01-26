@@ -18,7 +18,7 @@ class InviteCreateIn(BaseModel):
 def create_invite(
     payload: InviteCreateIn,
     conn=Depends(get_db),
-    current_user=Depends(require_admin),
+    current_user=Depends(require_contract_admin),
 ):
     token = uuid.uuid4().hex
     invite_url = f"{APP_BASE_URL}/invite.html?token={token}"
