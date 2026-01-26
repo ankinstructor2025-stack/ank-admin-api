@@ -16,6 +16,7 @@ from typing import Optional, List, Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
+
 from google.cloud import storage
 from google.oauth2 import service_account
 
@@ -26,34 +27,36 @@ from app.core import settings as app_settings  # BUCKET_NAME/UPLOAD_BUCKET 等
 
 router = APIRouter()
 
-# 画面と合わせる（.txt / .json / .csv、1KB〜100MB）
+# -------------------------
+# 設定
+# -------------------------
 ALLOWED_EXTS = {".txt", ".json", ".csv"}
-MIN_BYTES = 1024
-MAX_BYTES = 100 * 1024 * 1024
-
-# dialogue 月上限（OKになったものだけ count する想定）
-MAX_DIALOGUE_PER_MONTH = int(os.getenv("MAX_DIALOGUE_PER_MONTH", "5"))
-
-# 判定サンプル（先頭だけ読む）
-MAX_SAMPLE_BYTES_DEFAULT = 2_000_000
-
+MAX_BYTES = 100 * 1024 * 1024  # 100MB
+MIN_BYTES = 1
+MAX_DIALOGUE_PER_MONTH = 2000  # dialogueのみ：OKになったものだけカウント
 
 # -------------------------
-# util
+# Util
 # -------------------------
-def _month_key_jst() -> str:
-    # 月キーが必要なだけなので簡易でOK（厳密JSTが必要なら後で差し替え）
-    return datetime.now().strftime("%Y-%m")
-
-
 def _get_bucket_name() -> str:
-    bn = getattr(app_settings, "BUCKET_NAME", "") or ""
-    if not bn:
-        bn = getattr(app_settings, "UPLOAD_BUCKET", "") or ""
-    bn = (bn or "").strip()
-    if not bn:
-        raise HTTPException(status_code=500, detail="BUCKET_NAME (or UPLOAD_BUCKET) is not set")
-    return bn
+    name = (getattr(app_settings, "BUCKET_NAME", "") or os.environ.get("BUCKET_NAME") or "").strip()
+    if name:
+        return name
+    name = (getattr(app_settings, "UPLOAD_BUCKET", "") or os.environ.get("UPLOAD_BUCKET") or "").strip()
+    if name:
+        return name
+    raise HTTPException(status_code=500, detail="BUCKET_NAME (or UPLOAD_BUCKET) is not set")
+
+
+def _utc_now_iso() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _month_key_jst() -> str:
+    # 雑でOK：月単位上限のキー
+    # JST厳密が必要なら後で差し替え
+    now = datetime.utcnow()
+    return f"{now.year:04d}-{now.month:02d}"
 
 
 def _ext_lower(filename: str) -> str:
@@ -69,65 +72,131 @@ def _validate_file_meta(filename: str, size_bytes: int):
             status_code=400,
             detail="許可されていないファイル形式です（.txt / .json / .csv）",
         )
-    if size_bytes < MIN_BYTES:
-        raise HTTPException(status_code=400, detail="ファイルサイズが小さすぎます（1KB以上）")
     if size_bytes > MAX_BYTES:
         raise HTTPException(status_code=400, detail="ファイルサイズが大きすぎます（上限100MB）")
+    if size_bytes < MIN_BYTES:
+        raise HTTPException(status_code=400, detail="ファイルサイズが小さすぎます")
 
 
-def _storage_client_with_signer():
-    # 署名に使う鍵（Secret Manager を /secrets にマウントしている想定）
-    signer_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or "/secrets/ank-gcs-signer"
-    if os.path.exists(signer_path):
-        cred = service_account.Credentials.from_service_account_file(signer_path)
-        return storage.Client(credentials=cred)
-    # 無ければデフォルト（Cloud Run SA）
-    return storage.Client()
+def _safe_name(filename: str) -> str:
+    # object_key に使う：危険文字を除去
+    s = (filename or "file").strip()
+    s = s.replace("/", "_").replace("\\", "_").replace("..", "_")
+    s = re.sub(r"[^\w\.\-\(\)\[\]ぁ-んァ-ン一-龥]+", "_", s)
+    return s[:120] if len(s) > 120 else s
 
 
-def _gcs_read_head_text(object_key: str, limit_bytes: int) -> str:
+def _resolve_signer_file(path: str) -> Optional[str]:
+    """
+    Secret のマウントが
+      - /secrets/ank-gcs-signer (ファイル)
+      - /secrets/ank-gcs-signer (ディレクトリ配下にファイル)
+    のどちらでも拾えるようにする。
+    """
+    if not path:
+        return None
+
+    if os.path.isfile(path):
+        return path
+
+    if os.path.isdir(path):
+        # 直下のファイルを優先
+        try:
+            entries = sorted(os.listdir(path))
+        except Exception:
+            entries = []
+        # jsonっぽいファイル優先
+        cand = []
+        for e in entries:
+            p = os.path.join(path, e)
+            if os.path.isfile(p):
+                cand.append(p)
+        # *.json 優先
+        for p in cand:
+            if p.lower().endswith(".json"):
+                return p
+        # それ以外が1個ならそれ
+        if len(cand) == 1:
+            return cand[0]
+        # 複数あるなら "latest" や secret名っぽいのを優先
+        for p in cand:
+            base = os.path.basename(p).lower()
+            if base in ("latest", "key", "credentials", "service_account.json"):
+                return p
+        # 最後の手段：最初の1個
+        if cand:
+            return cand[0]
+
+    # path が存在しない or ファイルが見つからない
+    return None
+
+
+def _signer_credentials_from_env_or_secret() -> service_account.Credentials:
+    """
+    署名URL(v4 PUT)生成のためのサービスアカウント鍵を読む。
+    GOOGLE_APPLICATION_CREDENTIALS が dir/file どちらでもOK。
+    無ければ /secrets/ank-gcs-signer を dir/file どちらでもOK。
+    """
+    raw = (os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or "").strip() or "/secrets/ank-gcs-signer"
+    signer_file = _resolve_signer_file(raw)
+
+    if not signer_file:
+        # デバッグしやすい情報を含める（過不足ない程度）
+        detail = f"signer file not found: {raw}"
+        # raw が dir の場合は中身も出す（見える範囲）
+        if os.path.isdir(raw):
+            try:
+                detail += f" (dir entries={os.listdir(raw)})"
+            except Exception:
+                pass
+        raise HTTPException(status_code=500, detail=detail)
+
+    try:
+        return service_account.Credentials.from_service_account_file(signer_file)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to load signer credentials: {signer_file}: {e}")
+
+
+def _gcs_client_with_signer() -> storage.Client:
+    cred = _signer_credentials_from_env_or_secret()
+    return storage.Client(credentials=cred)
+
+
+def _gcs_read_head_text(object_key: str, max_bytes: int = 200_000) -> str:
     bucket_name = _get_bucket_name()
-    client = _storage_client_with_signer()
-    blob = client.bucket(bucket_name).blob(object_key)
-    data = blob.download_as_bytes(start=0, end=max(0, limit_bytes - 1))
-    return data.decode("utf-8", errors="replace")
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(object_key)
+    if not blob.exists():
+        raise HTTPException(status_code=400, detail="uploaded object not found in GCS")
+    data = blob.download_as_bytes(end=max_bytes - 1)
+    try:
+        return data.decode("utf-8", errors="replace")
+    except Exception:
+        return data.decode(errors="replace")
 
 
-def _gcs_delete(object_key: str) -> None:
+def _gcs_delete(object_key: str):
     bucket_name = _get_bucket_name()
-    client = _storage_client_with_signer()
-    blob = client.bucket(bucket_name).blob(object_key)
-    blob.delete()
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(object_key)
+    try:
+        blob.delete()
+    except Exception:
+        # 削除失敗は握る（ユーザにはNGメッセージを返したい）
+        pass
 
 
 # -------------------------
-# 判定（方式A〜F / 不可）
+# 判定ロジック（最小）
 # -------------------------
 class JudgeResult(BaseModel):
-    can_extract_qa: bool
-    method: Optional[str] = None  # "A".."F"
+    ok: bool
+    qa_mode: Optional[str] = None
     confidence: float = 0.0
     reasons: List[str] = []
     stats: Dict[str, Any] = {}
-
-
-_SPEAKER_PATTERNS = [
-    r"^\s*(user|assistant|system)\s*[:：]",
-    r"^\s*(u|a|s)\s*[:：]",
-    r"^\s*[^\s]{1,20}\s*[:：]\s+",
-]
-_QA_PATTERNS = [
-    r"^\s*Q\s*[:：]",
-    r"^\s*A\s*[:：]",
-    r"^\s*質問\s*[:：]",
-    r"^\s*回答\s*[:：]",
-]
-_QUOTE_PATTERNS = [
-    r"^\s*>",
-    r"^\s*From:\s",
-    r"^\s*Sent:\s",
-    r"^\s*Subject:\s",
-]
 
 
 def _count_matches(lines: List[str], patterns: List[str]) -> int:
@@ -161,96 +230,61 @@ def _try_parse_json(text: str) -> Optional[dict]:
 
 
 def _try_parse_csv(text: str) -> Optional[dict]:
-    head = "\n".join(text.splitlines()[:200])
     try:
-        f = StringIO(head)
-        reader = csv.reader(f)
-        rows = [r for r in reader if r]
-        if len(rows) < 2:
+        reader = csv.reader(StringIO(text))
+        rows = list(reader)
+        if not rows:
             return None
-        header = [c.strip().lower() for c in rows[0]]
-        has_speaker_text = ("speaker" in header and ("text" in header or "message" in header or "content" in header))
-        has_role_content = ("role" in header and ("content" in header or "text" in header or "message" in header))
-        if has_speaker_text or has_role_content:
-            return {"header": header}
-        return None
+        # 1行目がヘッダっぽい
+        header = rows[0]
+        return {"rows": len(rows), "cols": len(header)}
     except Exception:
         return None
 
 
-def _judge_text(object_key: str, text: str) -> JudgeResult:
-    ext = _ext_lower(object_key.split("/")[-1])
-    lines = text.splitlines()
-    nonempty = [ln for ln in lines if ln.strip()]
-
+def judge_qa_mode(filename: str, content_type: str, text: str) -> JudgeResult:
+    ext = _ext_lower(filename)
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     stats = {
         "ext": ext,
         "lines": len(lines),
-        "nonempty_lines": len(nonempty),
-        "sample_bytes": len(text.encode("utf-8", errors="ignore")),
+        "chars": len(text),
+        "content_type": content_type,
     }
 
-    if len(nonempty) < 10:
-        return JudgeResult(
-            can_extract_qa=False,
-            method=None,
-            confidence=0.0,
-            reasons=["内容が少なすぎます（行数が不足）"],
-            stats=stats,
-        )
+    if len(text.strip()) < 50:
+        return JudgeResult(ok=False, qa_mode=None, confidence=0.0, reasons=["内容が短すぎます"], stats=stats)
 
-    # JSON → 方式B
+    # JSON
     if ext == ".json" or _looks_like_json(text):
-        meta = _try_parse_json(text)
-        if meta:
-            return JudgeResult(
-                can_extract_qa=True,
-                method="B",
-                confidence=0.92,
-                reasons=[f"JSONとして解析できる（{meta.get('kind')}）"],
-                stats={**stats, "json_kind": meta.get("kind")},
-            )
+        j = _try_parse_json(text)
+        if j:
+            return JudgeResult(ok=True, qa_mode=f"json:{j['kind']}", confidence=0.85, reasons=["JSONとして解析できました"], stats=stats)
 
-    # CSV → 方式C
+    # CSV
     if ext == ".csv":
-        meta = _try_parse_csv(text)
-        if meta:
-            return JudgeResult(
-                can_extract_qa=True,
-                method="C",
-                confidence=0.9,
-                reasons=["CSVヘッダに speaker/text または role/content がある"],
-                stats={**stats, "csv_header": meta.get("header")},
-            )
+        c = _try_parse_csv(text)
+        if c:
+            return JudgeResult(ok=True, qa_mode="csv", confidence=0.75, reasons=["CSVとして解析できました"], stats=stats)
 
-    # カウント系
-    speaker_markers = _count_matches(nonempty[:2000], _SPEAKER_PATTERNS)
-    qa_markers = _count_matches(nonempty[:2000], _QA_PATTERNS)
-    quote_markers = _count_matches(nonempty[:2000], _QUOTE_PATTERNS)
+    # text dialogueっぽい（簡易）
+    pat_dialogue = [
+        r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}",
+        r"発言",
+        r"質問",
+        r"答弁",
+        r"委員",
+        r"大臣",
+    ]
+    hit = _count_matches(lines[:200], pat_dialogue)
+    if hit >= 3:
+        return JudgeResult(ok=True, qa_mode="text:dialogue", confidence=0.7, reasons=["対話/議事録っぽい特徴がありました"], stats={**stats, "hit": hit})
 
-    stats.update({
-        "speaker_markers": speaker_markers,
-        "qa_markers": qa_markers,
-        "quote_markers": quote_markers,
-    })
+    # 一般テキスト
+    if len(lines) >= 5:
+        return JudgeResult(ok=True, qa_mode="text:generic", confidence=0.55, reasons=["一般テキストとして取り扱います"], stats=stats)
 
-    # 方式E：Q/A形式が強い
-    if qa_markers >= 6:
-        return JudgeResult(True, "E", 0.85, ["Q/A 記法が一定数ある（Q:, A: など）"], stats)
-
-    # 方式F：メール/チケット/引用っぽい
-    if quote_markers >= 6:
-        return JudgeResult(True, "F", 0.75, ["引用/ヘッダ行が多い（メール/スレ形式の可能性）"], stats)
-
-    # 方式A：話者ラベルの対話
-    if speaker_markers >= 10:
-        return JudgeResult(True, "A", 0.78, ["話者ラベルが複数回出現（User:, Assistant: など）"], stats)
-
-    # 方式D：単一文章（QA生成寄り）
-    if len(nonempty) >= 30:
-        return JudgeResult(True, "D", 0.6, ["文章量があるため単一文書としてQA化（生成寄り）が可能"], stats)
-
-    return JudgeResult(False, None, 0.0, ["形式が判定できません（特徴が弱い）"], stats)
+    return JudgeResult(ok=False, qa_mode=None, confidence=0.0, reasons=["形式が判定できません（特徴が弱い）"], stats=stats)
 
 
 # -------------------------
@@ -271,10 +305,12 @@ def create_upload_url(
     user=Depends(require_user),
     conn=Depends(get_db),
 ):
+    # 1) 認証
     uid = (user.get("uid") or "").strip()
     if not uid:
         raise HTTPException(status_code=400, detail="no uid in token")
 
+    # 2) 入力
     contract_id = (req.contract_id or "").strip()
     if not contract_id:
         raise HTTPException(status_code=400, detail="contract_id is required")
@@ -282,9 +318,8 @@ def create_upload_url(
     require_contract_admin(uid, contract_id, conn)
     _validate_file_meta(req.filename, int(req.size_bytes or 0))
 
+    # 3) 月キー＆上限（OKのときだけカウント = upload_logs参照）
     mk = _month_key_jst()
-
-    # 上限判定は「OKになったものだけ」数える（= upload_logs のみ参照）
     if (req.kind or "dialogue") == "dialogue":
         with conn.cursor() as cur:
             cur.execute(
@@ -304,18 +339,14 @@ def create_upload_url(
                 detail=f"dialogue uploads limit reached: {cnt}/{MAX_DIALOGUE_PER_MONTH} for {mk}",
             )
 
-    upload_id = uuid.uuid4().hex
-    safe_name = (req.filename or "file").replace("/", "_").replace("\\", "_")
-    object_key = f"contracts/{contract_id}/{mk}/{upload_id}_{safe_name}"
+    # 4) object_key
+    upload_id = str(uuid.uuid4())
+    safe = _safe_name(req.filename)
+    object_key = f"contracts/{contract_id}/{mk}/{upload_id}_{safe}"
 
-    # Signed URL（PUT）
-    signer_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or "/secrets/ank-gcs-signer"
-    if not os.path.exists(signer_path):
-        raise HTTPException(status_code=500, detail=f"signer file not found: {signer_path}")
-
-    credentials = service_account.Credentials.from_service_account_file(signer_path)
+    # 5) Signed URL（ここが落ちやすいので“確実に読める signer”に寄せる）
     bucket_name = _get_bucket_name()
-    client = storage.Client(credentials=credentials)
+    client = _gcs_client_with_signer()  # ← Secretがdirでもfileでも解決する
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(object_key)
 
@@ -341,6 +372,7 @@ def upload_finalize(
     user=Depends(require_user),
     conn=Depends(get_db),
 ):
+    # 1) 認証
     uid = (user.get("uid") or "").strip()
     if not uid:
         raise HTTPException(status_code=400, detail="no uid in token")
@@ -348,74 +380,50 @@ def upload_finalize(
     contract_id = (payload.get("contract_id") or "").strip()
     object_key = (payload.get("object_key") or "").strip()
     upload_id = (payload.get("upload_id") or "").strip()
-    kind = (payload.get("kind") or "dialogue").strip()  # フロントが送らなくてもOK
-    sample_bytes = int(payload.get("sample_bytes") or MAX_SAMPLE_BYTES_DEFAULT)
+    filename = (payload.get("filename") or "").strip()  # 任意
+    content_type = (payload.get("content_type") or "").strip()  # 任意
 
     if not contract_id or not object_key or not upload_id:
         raise HTTPException(status_code=400, detail="contract_id, object_key, upload_id are required")
 
     require_contract_admin(uid, contract_id, conn)
 
-    # 1) GCS先頭サンプルを読む
-    try:
-        text = _gcs_read_head_text(object_key, max(10_000, min(sample_bytes, MAX_SAMPLE_BYTES_DEFAULT)))
-    except Exception as e:
-        # 読めない＝NG。削除は試みる
-        try:
-            _gcs_delete(object_key)
-        except Exception:
-            pass
-        raise HTTPException(status_code=500, detail=f"failed to read uploaded file: {e}")
+    # 2) GCSから先頭を読む（判定用）
+    text = _gcs_read_head_text(object_key)
+    judge = judge_qa_mode(filename or object_key, content_type, text)
 
-    # 2) 判定
-    judge = _judge_text(object_key, text)
+    if not judge.ok:
+        # NG：削除して返す
+        _gcs_delete(object_key)
+        return {
+            "ok": False,
+            "message": "QA化できない形式です",
+            "reasons": judge.reasons,
+            "stats": judge.stats,
+        }
 
-    # 3) NGなら削除してエラー
-    if not judge.can_extract_qa:
-        try:
-            _gcs_delete(object_key)
-        except Exception as e:
-            # 削除に失敗しても「NG」はNG。理由だけ返す
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "message": "QA化できません（削除に失敗）",
-                    "reasons": judge.reasons,
-                    "delete_error": str(e),
-                },
-            )
-
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "message": "QA化できません（アップロードしたファイルは削除しました）",
-                "reasons": judge.reasons,
-                "stats": judge.stats,
-            },
-        )
-
-    # 4) OKなら upload_logs に INSERT（OK時だけ）
+    # 3) OK：upload_logsへINSERT（OKのときだけ）
     mk = _month_key_jst()
+    kind = "dialogue"
+
     with conn.cursor() as cur:
-        # 最小カラムだけ（あなたの既存SELECTに合わせる）
         cur.execute(
             """
-            INSERT INTO upload_logs (upload_id, contract_id, kind, object_key, month_key, created_at)
-            VALUES (%s, %s, %s, %s, %s, NOW())
+            INSERT INTO upload_logs
+              (upload_id, contract_id, kind, object_key, month_key, qa_mode, confidence, created_at)
+            VALUES
+              (%s, %s, %s, %s, %s, %s, %s, NOW())
             """,
-            (upload_id, contract_id, kind, object_key, mk),
+            (upload_id, contract_id, kind, object_key, mk, judge.qa_mode, float(judge.confidence)),
         )
     conn.commit()
 
-    # 方式を返す（フロント表示用）
     return {
         "ok": True,
         "upload_id": upload_id,
         "contract_id": contract_id,
         "object_key": object_key,
-        "month_key": mk,
-        "can_extract_qa": True,
-        "method": judge.method,
+        "qa_mode": judge.qa_mode,
         "confidence": judge.confidence,
         "reasons": judge.reasons,
         "stats": judge.stats,
