@@ -269,5 +269,3 @@ def judge_method(
 
     # 5) 返す
     return result
-
-app.include_router(router)
