@@ -11,4 +11,3 @@ def setup_cors(app):
         expose_headers=["*"],
         max_age=3600,
     )
-)
