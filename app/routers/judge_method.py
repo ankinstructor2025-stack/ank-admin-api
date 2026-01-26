@@ -12,6 +12,8 @@ from app.services.contracts_acl import require_contract_admin
 
 router = APIRouter()
 
+MAX_SAMPLE_BYTES_DEFAULT = 2_000_000
+
 class JudgeMethodIn(BaseModel):
     contract_id: str = Field(..., min_length=1)
     object_key: Optional[str] = None
