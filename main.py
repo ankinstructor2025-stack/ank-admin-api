@@ -18,7 +18,6 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from google.cloud import storage
 from google.oauth2 import service_account
-from google.api_core.exceptions import NotFound
 from typing import Optional, List, Dict, Any
 
 # =========================================================
@@ -378,7 +377,7 @@ def users_select(conn=Depends(get_db)):
 # =========================================================
 
 JST = ZoneInfo("Asia/Tokyo")
-UPLOAD_BUCKET = os.environ.get("UPLOAD_BUCKET", "")
+BUCKET_NAME = os.environ.get("UPLOAD_BUCKET", "ank-bucket")
 MAX_DIALOGUE_PER_MONTH = int(os.environ.get("MAX_DIALOGUE_PER_MONTH", "5"))
 
 def month_key_jst() -> str:
@@ -423,7 +422,7 @@ def list_dialogues(
 
     contract_id = (contract_id or "").strip()
     if not contract_id:
-        raise HTTPException(status_code=400, detail="contract_id required")
+        raise HTTPException(status_code=400, detail="contract_id is required")
 
     require_contract_admin(uid, contract_id, conn)
 
@@ -480,15 +479,15 @@ def activate_dialogue(
     user=Depends(require_user),
     conn=Depends(get_db),
 ):
+    contract_id = (payload.get("contract_id") or "").strip()
     object_key = (payload.get("object_key") or "").strip()
+
+    if not contract_id or not object_key:
+        raise HTTPException(status_code=400, detail="contract_id and object_key are required")
 
     uid = (user.get("uid") or "").strip()
     if not uid:
         raise HTTPException(status_code=400, detail="no uid in token")
-
-    contract_id = (payload.get("contract_id") or "").strip()
-    if not contract_id:
-        raise HTTPException(status_code=400, detail="contract_id required")
 
     require_contract_admin(uid, contract_id, conn)
 
@@ -568,75 +567,43 @@ def build_qa_from_active_dialogue(
 
 @router.post("/v1/admin/upload-finalize")
 def upload_finalize(
-    req: UploadFinalizeRequest,
+    payload: dict,
     user=Depends(require_user),
     conn=Depends(get_db),
 ):
+    contract_id = (payload.get("contract_id") or "").strip()
+    object_key = (payload.get("object_key") or "").strip()
+    upload_id = (payload.get("upload_id") or "").strip()
+
+    if not contract_id or not object_key or not upload_id:
+        raise HTTPException(status_code=400, detail="contract_id, object_key, upload_id are required")
+
     uid = (user.get("uid") or "").strip()
     if not uid:
         raise HTTPException(status_code=400, detail="no uid in token")
 
-    # 契約管理者チェック
-    require_contract_admin(uid, req.contract_id, conn)
+    require_contract_admin(uid, contract_id, conn)
 
-    try:
-        text = _gcs_read_head_text(req.object_key)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"failed to read gcs object: {e}")
-
-    # ---- 方式判定（すでに動いているロジックを使用） ----
-    judge = judge_dialogue_text(
-        filename=req.object_key,
-        text=text,
-    )
-
-    if not judge["can_extract_qa"]:
-        # QA不可 → GCS削除 → DBには一切残さない
-        _gcs_delete_object_safe(req.object_key)
-        raise HTTPException(
-            status_code=400,
-            detail="QA抽出できません: " + " / ".join(judge["reasons"]),
-        )
-
-    # ---- ここで初めて DB INSERT ----
     with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO upload_logs (
-                upload_id,
-                contract_id,
-                object_key,
-                judge_method,
-                judge_confidence,
-                judge_reasons,
-                judge_stats
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """,
-            (
-                req.upload_id,
-                req.contract_id,
-                req.object_key,
-                judge["method"],
-                judge["confidence"],
-                json.dumps(judge["reasons"], ensure_ascii=False),
-                json.dumps(judge["stats"], ensure_ascii=False),
-            ),
-        )
+        cur.execute("""
+            SELECT 1
+            FROM upload_logs
+            WHERE upload_id = %s
+              AND contract_id = %s
+              AND object_key = %s
+            LIMIT 1
+        """, (upload_id, contract_id, object_key))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="upload log not found")
 
-    conn.commit()
-    return {
-        "ok": True,
-        "upload_id": req.upload_id,
-        "object_key": req.object_key,
-        "judge": judge,
-    }
+    return {"ok": True}
 
 class UploadUrlRequest(BaseModel):
     contract_id: str
+    kind: str = "dialogue"
     filename: str
     content_type: str
     note: str | None = None
-
 
 @router.post("/v1/admin/upload-url")
 def create_upload_url(
@@ -644,33 +611,65 @@ def create_upload_url(
     user=Depends(require_user),
     conn=Depends(get_db),
 ):
-
+    # 1) 認証
     uid = (user.get("uid") or "").strip()
     if not uid:
         raise HTTPException(status_code=400, detail="no uid in token")
 
+    # 2) 入力
     contract_id = (req.contract_id or "").strip()
     if not contract_id:
-        raise HTTPException(status_code=400, detail="contract_id required")
+        raise HTTPException(status_code=400, detail="contract_id is required")
 
+    # 3) 契約 admin チェック
     require_contract_admin(uid, contract_id, conn)
 
-    bucket_name = os.environ.get("UPLOAD_BUCKET")
-    if not bucket_name:
-        raise HTTPException(status_code=500, detail="UPLOAD_BUCKET is not set")
+    # 4) 月5件制限（dialogueのみ）
+    mk = month_key_jst()
+    if req.kind == "dialogue":
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT COUNT(*)
+                FROM upload_logs
+                WHERE contract_id = %s
+                  AND kind = 'dialogue'
+                  AND month_key = %s
+            """, (contract_id, mk))
+            cnt = int(cur.fetchone()[0] or 0)
 
-    upload_id = str(uuid.uuid4())
+        if cnt >= MAX_DIALOGUE_PER_MONTH:
+            raise HTTPException(
+                status_code=409,
+                detail=f"dialogue uploads limit reached: {cnt}/{MAX_DIALOGUE_PER_MONTH} for {mk}"
+            )
 
-    object_key = (
-        f"contracts/{req.contract_id}/"
-        f"dialogues/{upload_id}_{req.filename}"
-    )
+    # 5) object_key（contracts/ で統一）
+    upload_id = uuid.uuid4()
+    safe_name = (req.filename or "file").replace("/", "_").replace("\\", "_")
+    object_key = f"contracts/{contract_id}/{mk}/{upload_id}_{safe_name}"
 
-    client = storage.Client()
-    bucket = client.bucket(bucket_name)
+    # 6) 台帳INSERT（乱発抑止）
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO upload_logs (upload_id, contract_id, kind, object_key, month_key, created_at)
+            VALUES (%s, %s, %s, %s, %s, NOW())
+        """, (str(upload_id), contract_id, req.kind, object_key, mk))
+    conn.commit()
+
+    # 7) 署名URL（Secret Managerを /secrets にマウントした鍵で署名する）
+    signer_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or "/secrets/ank-gcs-signer"
+
+    # Secret が正しくマウントされていない場合はここで落とす（原因が分かりやすい）
+    if not os.path.exists(signer_path):
+        raise HTTPException(status_code=500, detail=f"signer file not found: {signer_path}")
+
+    credentials = service_account.Credentials.from_service_account_file(signer_path)
+
+    client = storage.Client(credentials=credentials)
+    bucket = client.bucket(BUCKET_NAME)
     blob = bucket.blob(object_key)
 
-    upload_url = blob.generate_signed_url(
+    url = blob.generate_signed_url(
         version="v4",
         expiration=timedelta(minutes=15),
         method="PUT",
@@ -678,9 +677,9 @@ def create_upload_url(
     )
 
     return {
-        "upload_id": upload_id,
+        "upload_id": str(upload_id),
         "object_key": object_key,
-        "upload_url": upload_url,
+        "upload_url": url,
     }
 
 # =========================================================
@@ -1115,28 +1114,18 @@ class JudgeMethodOut(BaseModel):
 # -------------------------
 # Helpers
 # -------------------------
-def _gcs_read_head_text(object_key: str, limit_bytes: int = 200_000) -> str:
-    bucket_name = os.environ.get("UPLOAD_BUCKET")
-    if not bucket_name:
-        raise HTTPException(status_code=500, detail="UPLOAD_BUCKET is not set")
+def _gcs_read_head_text(object_key: str, limit_bytes: int) -> str:
+    if not GCS_BUCKET:
+        raise HTTPException(status_code=500, detail="GCS_BUCKET is not set")
 
     client = storage.Client()
-    blob = client.bucket(bucket_name).blob(object_key)
+    bucket = client.bucket(GCS_BUCKET)
+    blob = bucket.blob(object_key)
+
+    # download first N bytes
     data = blob.download_as_bytes(start=0, end=limit_bytes - 1)
+    # 文字化けしても落ちないように
     return data.decode("utf-8", errors="replace")
-
-
-def _gcs_delete_object_safe(object_key: str) -> None:
-    bucket_name = os.environ.get("UPLOAD_BUCKET")
-    if not bucket_name:
-        return
-
-    client = storage.Client()
-    blob = client.bucket(bucket_name).blob(object_key)
-    try:
-        blob.delete()
-    except NotFound:
-        pass
 
 def _ext_from_key(object_key: str) -> str:
     name = (object_key or "").split("/")[-1]
