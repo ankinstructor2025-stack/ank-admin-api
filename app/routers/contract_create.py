@@ -4,6 +4,7 @@ from typing import Optional
 
 from app.deps.db import get_db
 from app.services.contracts_acl import require_admin
+from app.deps.auth import require_user
 
 router = APIRouter()
 
