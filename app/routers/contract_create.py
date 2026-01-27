@@ -11,16 +11,13 @@ from app.deps.auth import require_user
 # GCS
 from google.cloud import storage
 
+from app.core.settings import BUCKET_NAME
+
 router = APIRouter()
 
 # ==========
 # Settings
 # ==========
-TENANT_BUCKET = os.environ.get("TENANT_BUCKET")  # 必須
-if not TENANT_BUCKET:
-    # import時に落ちるとデバッグしにくいので、実行時チェックにする
-    TENANT_BUCKET = ""
-
 APP_BASE_URL = os.environ.get(
     "APP_BASE_URL",
     "https://ankinstructor2025-stack.github.io/ank-knowledge"
@@ -45,9 +42,9 @@ def _now_iso() -> str:
 
 
 def _bucket():
-    if not TENANT_BUCKET:
-        raise HTTPException(status_code=500, detail="TENANT_BUCKET is not set")
-    return _storage_client.bucket(TENANT_BUCKET)
+    if not BUCKET_NAME:
+        raise HTTPException(status_code=500, detail="BUCKET_NAME is not set")
+    return _storage_client.bucket(BUCKET_NAME)
 
 
 def _upload_json(bucket, path: str, data: dict, *, if_generation_match=None):

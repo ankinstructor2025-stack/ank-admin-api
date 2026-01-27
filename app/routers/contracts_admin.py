@@ -8,9 +8,10 @@ from pydantic import BaseModel
 from app.deps.auth import require_user
 from google.cloud import storage
 
+from app.core.settings import BUCKET_NAME
+
 router = APIRouter()
 
-TENANT_BUCKET = os.environ.get("TENANT_BUCKET", "")
 _storage = storage.Client()
 
 
@@ -31,9 +32,9 @@ def _now_iso() -> str:
 
 
 def _bucket():
-    if not TENANT_BUCKET:
-        raise HTTPException(status_code=500, detail="TENANT_BUCKET is not set")
-    return _storage.bucket(TENANT_BUCKET)
+    if not BUCKET_NAME:
+        raise HTTPException(status_code=500, detail="BUCKET_NAME is not set")
+    return _storage.bucket(BUCKET_NAME)
 
 
 def _read_json_with_generation(bucket, path: str):
