@@ -1,11 +1,18 @@
+import os
+import json
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
-from typing import Optional
+from pydantic import BaseModel
 
 from app.deps.auth import require_user
-from app.deps.db import get_db
+from google.cloud import storage
 
 router = APIRouter()
+
+TENANT_BUCKET = os.environ.get("TENANT_BUCKET", "")
+_storage = storage.Client()
+
 
 class ContractUpdateIn(BaseModel):
     contract_id: str
@@ -14,147 +21,117 @@ class ContractUpdateIn(BaseModel):
     monthly_amount_yen: int
     note: str | None = None
 
-@router.post("/v1/contracts/update")
-def update_contract(
-    payload: ContractUpdateIn,
-    user=Depends(require_user),
-    conn=Depends(get_db),
-):
-    user_id = user["uid"]
 
-    with conn.cursor() as cur:
-        # 1) このユーザーが、その契約の admin か確認
-        cur.execute("""
-            SELECT 1
-            FROM user_contracts
-            WHERE user_id = %s
-              AND contract_id = %s
-              AND role = 'admin'
-              AND status = 'active'
-            LIMIT 1
-        """, (user_id, payload.contract_id))
-        if not cur.fetchone():
-            raise HTTPException(status_code=403, detail="admin only for this contract")
-
-        # 2) contracts 更新
-        cur.execute("""
-            UPDATE contracts
-            SET
-              seat_limit = %s,
-              knowledge_count = %s,
-              monthly_amount_yen = %s,
-              note = %s,
-              updated_at = NOW()
-            WHERE contract_id = %s
-        """, (
-            payload.seat_limit,
-            payload.knowledge_count,
-            payload.monthly_amount_yen,
-            (payload.note or None),
-            payload.contract_id,
-        ))
-
-    conn.commit()
-    return {"ok": True}
-
-from fastapi import Query, HTTPException
-
-@router.get("/v1/contracts/members")
-def list_members(
-    contract_id: str = Query(...),
-    user=Depends(require_user),
-    conn=Depends(get_db),
-):
-    uid = user["uid"]
-
-    with conn.cursor() as cur:
-        # 1) admin か確認
-        cur.execute("""
-            SELECT 1
-            FROM user_contracts
-            WHERE user_id=%s AND contract_id=%s AND role='admin' AND status='active'
-            LIMIT 1
-        """, (uid, contract_id))
-        if not cur.fetchone():
-            raise HTTPException(status_code=403, detail="admin only for this contract")
-
-        # 2) 支払い設定チェック（未設定なら弾く）
-        cur.execute("""
-            SELECT payment_method_configured
-            FROM contracts
-            WHERE contract_id=%s
-            LIMIT 1
-        """, (contract_id,))
-        row = cur.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="contract not found")
-        if not row[0]:
-            raise HTTPException(status_code=409, detail="payment is not configured")
-
-        # 3) メンバー一覧
-        cur.execute("""
-            SELECT u.email, uc.role, uc.status, u.last_login_at
-            FROM user_contracts uc
-            LEFT JOIN users u ON u.user_id = uc.user_id
-            WHERE uc.contract_id = %s
-            ORDER BY uc.role DESC, u.email NULLS LAST
-        """, (contract_id,))
-        rows = cur.fetchall()
-
-    return {
-        "contract_id": contract_id,
-        "members": [
-            {
-                "email": r[0],
-                "role": r[1],
-                "status": r[2],
-                "last_login_at": r[3].isoformat() if r[3] else None,
-            }
-            for r in rows
-        ]
-    }
-
-class ContractMarkPaidIn(BaseModel):
+class ContractIdIn(BaseModel):
     contract_id: str
 
-@router.post("/v1/contracts/mark-paid")
-def mark_paid(
-    payload: ContractMarkPaidIn,
-    user=Depends(require_user),
-    conn=Depends(get_db),
-):
-    """
-    「支払い設定へ」を押したら完了扱いにする（仮）
-    - payment_method_configured = TRUE
-    - start_at が未設定なら NOW() で埋める（利用開始日）
-    """
-    user_id = user["uid"]
 
-    with conn.cursor() as cur:
-        # このユーザーが、その契約の admin か確認（updateと同じ条件）
-        cur.execute("""
-            SELECT 1
-            FROM user_contracts
-            WHERE user_id = %s
-              AND contract_id = %s
-              AND role = 'admin'
-              AND status = 'active'
-            LIMIT 1
-        """, (user_id, payload.contract_id))
-        if not cur.fetchone():
-            raise HTTPException(status_code=403, detail="admin only for this contract")
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-        # 支払い設定「完了」扱い
-        cur.execute("""
-            UPDATE contracts
-            SET
-              payment_method_configured = TRUE,
-              start_at = COALESCE(start_at, NOW()),
-              updated_at = NOW()
-            WHERE contract_id = %s
-        """, (payload.contract_id,))
 
-    conn.commit()
+def _bucket():
+    if not TENANT_BUCKET:
+        raise HTTPException(status_code=500, detail="TENANT_BUCKET is not set")
+    return _storage.bucket(TENANT_BUCKET)
+
+
+def _read_json_with_generation(bucket, path: str):
+    blob = bucket.blob(path)
+    if not blob.exists():
+        raise HTTPException(status_code=404, detail="not found")
+    text = blob.download_as_text(encoding="utf-8")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="invalid json")
+    # generation は GCS のオブジェクト世代（楽観ロックに使う）
+    blob.reload()
+    return data, blob.generation
+
+
+def _write_json_if_generation_matches(bucket, path: str, data: dict, generation: int):
+    blob = bucket.blob(path)
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    blob.upload_from_string(
+        payload,
+        content_type="application/json; charset=utf-8",
+        if_generation_match=generation,
+    )
+    return blob
+
+
+def _require_contract_admin(bucket, contract_id: str, uid: str):
+    member_path = f"tenants/{contract_id}/members/{uid}.json"
+    member_blob = bucket.blob(member_path)
+    if not member_blob.exists():
+        raise HTTPException(status_code=403, detail="not a member")
+    member = json.loads(member_blob.download_as_text(encoding="utf-8"))
+    if (member.get("status") or "") != "active":
+        raise HTTPException(status_code=403, detail="inactive member")
+    role = (member.get("role") or "").strip()
+    if role not in ("owner", "admin"):
+        raise HTTPException(status_code=403, detail="not an admin")
+    return member
+
+
+@router.post("/v1/contracts/update")
+def update_contract(payload: ContractUpdateIn, user=Depends(require_user)):
+    uid = (user.get("uid") or "").strip()
+    if not uid:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    contract_id = (payload.contract_id or "").strip()
+    if not contract_id:
+        raise HTTPException(status_code=400, detail="contract_id is required")
+
+    bucket = _bucket()
+    _require_contract_admin(bucket, contract_id, uid)
+
+    contract_path = f"tenants/{contract_id}/contract.json"
+    contract, gen = _read_json_with_generation(bucket, contract_path)
+
+    now = _now_iso()
+    contract["seat_limit"] = int(payload.seat_limit)
+    contract["knowledge_count"] = int(payload.knowledge_count)
+    contract["monthly_amount_yen"] = int(payload.monthly_amount_yen)
+    contract["note"] = (payload.note or "").strip() or None
+    contract["updated_at"] = now
+
+    # 楽観ロック（別タブ更新などの衝突を検知）
+    try:
+        _write_json_if_generation_matches(bucket, contract_path, contract, gen)
+    except Exception:
+        # generation不一致など
+        raise HTTPException(status_code=409, detail="conflict")
+
     return {"ok": True}
 
 
+@router.post("/v1/contracts/mark-paid")
+def mark_paid(payload: ContractIdIn, user=Depends(require_user)):
+    uid = (user.get("uid") or "").strip()
+    if not uid:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    contract_id = (payload.contract_id or "").strip()
+    if not contract_id:
+        raise HTTPException(status_code=400, detail="contract_id is required")
+
+    bucket = _bucket()
+    _require_contract_admin(bucket, contract_id, uid)
+
+    contract_path = f"tenants/{contract_id}/contract.json"
+    contract, gen = _read_json_with_generation(bucket, contract_path)
+
+    now = _now_iso()
+    contract["payment_method_configured"] = True
+    contract["start_at"] = contract.get("start_at") or now
+    contract["updated_at"] = now
+
+    try:
+        _write_json_if_generation_matches(bucket, contract_path, contract, gen)
+    except Exception:
+        raise HTTPException(status_code=409, detail="conflict")
+
+    return {"ok": True}
