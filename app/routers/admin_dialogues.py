@@ -24,12 +24,7 @@ def _get_knowledge_base_url() -> str:
         raise HTTPException(status_code=500, detail="KNOWLEDGE_API_BASE_URL is not set")
     return base.rstrip("/")
 
-
 def _http_post_json(url: str, payload: dict, timeout_sec: int = 15) -> dict:
-    """
-    標準ライブラリだけでJSON POST。
-    失敗時は例外を投げる（呼び出し側で502にする）。
-    """
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url=url,
@@ -37,25 +32,32 @@ def _http_post_json(url: str, payload: dict, timeout_sec: int = 15) -> dict:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+
     try:
         with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
             body = resp.read().decode("utf-8", errors="replace")
-            # JSONでなければrawで返す
             try:
                 return json.loads(body)
             except Exception:
                 return {"raw": body}
+
     except urllib.error.HTTPError as e:
-        # knowledge側が4xx/5xx返した場合
         raw = e.read().decode("utf-8", errors="replace")
+
+        # JSONなら整形して「文字列」で返す（UIログで読めるように）
         try:
             j = json.loads(raw)
+            detail_text = json.dumps(
+                {"knowledge_status": e.code, "body": j},
+                ensure_ascii=False
+            )
         except Exception:
-            j = {"raw": raw}
-        raise HTTPException(status_code=502, detail={"knowledge_status": e.code, "body": j})
+            detail_text = f"knowledge_status={e.code} body={raw}"
+
+        raise HTTPException(status_code=502, detail=detail_text)
+
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"failed to call knowledge api: {e}")
-
 
 @router.get("/v1/admin/dialogues")
 def list_dialogues(
