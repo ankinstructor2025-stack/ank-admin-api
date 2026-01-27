@@ -6,7 +6,8 @@
 #    - OK：upload_logs に INSERT（OKの時だけ）
 #
 # 重要：
-# - upload_logs のスキーマが古い（qa_mode/confidenceが無い）場合でも 500 で落ちないようにフォールバックする
+# - upload_logs のスキーマが古い場合でも 500 で落ちないようにフォールバックする
+# - 方式は A-F（A:話者ラベル対話 / B:JSON / C:CSV / D:単一文書 / E:QA形式 / F:ログ/チケット/メール）
 
 import os
 import re
@@ -194,25 +195,14 @@ def _db_has_columns(conn, table: str, cols: List[str]) -> Dict[str, bool]:
 
 
 # -------------------------
-# 判定ロジック（最小）
+# 判定ロジック（A-F）
 # -------------------------
 class JudgeResult(BaseModel):
     ok: bool
-    qa_mode: Optional[str] = None
+    qa_mode: Optional[str] = None   # "A"..."F"
     confidence: float = 0.0
     reasons: List[str] = []
     stats: Dict[str, Any] = {}
-
-
-def _count_matches(lines: List[str], patterns: List[str]) -> int:
-    regs = [re.compile(p, re.IGNORECASE) for p in patterns]
-    n = 0
-    for ln in lines:
-        for rg in regs:
-            if rg.search(ln):
-                n += 1
-                break
-    return n
 
 
 def _looks_like_json(text: str) -> bool:
@@ -224,6 +214,7 @@ def _try_parse_json(text: str) -> Optional[dict]:
     try:
         obj = json.loads(text)
         if isinstance(obj, dict):
+            # {"messages":[...]} 形式など
             if isinstance(obj.get("messages"), list):
                 return {"kind": "messages"}
         if isinstance(obj, list):
@@ -241,15 +232,43 @@ def _try_parse_csv(text: str) -> Optional[dict]:
         if not rows:
             return None
         header = rows[0]
-        return {"rows": len(rows), "cols": len(header)}
+        # それっぽい列名が無くてもCSVとしては成立しているのでOK扱い
+        header_l = [str(h or "").strip().lower() for h in header]
+        return {"rows": len(rows), "cols": len(header), "header": header_l}
     except Exception:
         return None
 
 
-def judge_qa_mode(filename: str, content_type: str, text: str) -> JudgeResult:
+def _looks_like_speaker_dialogue(lines: List[str]) -> int:
+    # 例: "山田: こんにちは" / "A：..." / "User: ..."
+    rg = re.compile(r"^[^:：]{1,20}[:：]\s*\S+")
+    return sum(1 for ln in lines[:200] if rg.search(ln))
+
+
+def _looks_like_qa_style(lines: List[str]) -> int:
+    # 例: "Q: ..." "A: ..." / "質問:" "回答:"
+    rg = re.compile(r"^(Q[:：]|A[:：]|質問[:：]|回答[:：])\s*\S+", re.IGNORECASE)
+    return sum(1 for ln in lines[:200] if rg.search(ln))
+
+
+def _looks_like_ticket_mail(text: str, lines: List[str]) -> bool:
+    # メール/チケット/スレ: ヘッダ、引用、区切り、タイムスタンプ等
+    head = "\n".join(lines[:80]).lower()
+    if "subject:" in head or "from:" in head or "to:" in head or "cc:" in head or "date:" in head:
+        return True
+    if "-----original message-----" in head or "返信:" in head or "転送:" in head:
+        return True
+    if any(ln.startswith(">") for ln in lines[:200]):
+        return True
+    if re.search(r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b", "\n".join(lines[:200])):
+        return True
+    return False
+
+
+def _detect_mode_A_to_F(filename: str, content_type: str, text: str) -> Tuple[bool, Optional[str], float, List[str], Dict[str, Any]]:
     ext = _ext_lower(filename)
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    stats = {
+    stats: Dict[str, Any] = {
         "ext": ext,
         "lines": len(lines),
         "chars": len(text),
@@ -257,38 +276,48 @@ def judge_qa_mode(filename: str, content_type: str, text: str) -> JudgeResult:
     }
 
     if len(text.strip()) < 50:
-        return JudgeResult(ok=False, qa_mode=None, confidence=0.0, reasons=["内容が短すぎます"], stats=stats)
+        return False, None, 0.0, ["内容が短すぎます"], stats
 
-    # JSON
+    # B: JSON（messages配列 / role付き）
     if ext == ".json" or _looks_like_json(text):
         j = _try_parse_json(text)
         if j:
-            return JudgeResult(ok=True, qa_mode=f"json:{j['kind']}", confidence=0.85, reasons=["JSONとして解析できました"], stats=stats)
+            stats["json_kind"] = j.get("kind")
+            return True, "B", 0.90, ["JSON（messages/role）として判定"], stats
 
-    # CSV
+    # C: CSV（列あり：speaker,text / role,content）
     if ext == ".csv":
         c = _try_parse_csv(text)
         if c:
-            return JudgeResult(ok=True, qa_mode="csv", confidence=0.75, reasons=["CSVとして解析できました"], stats=stats)
+            stats.update({"csv_rows": c.get("rows"), "csv_cols": c.get("cols"), "csv_header": c.get("header")})
+            return True, "C", 0.80, ["CSVとして判定"], stats
 
-    # text dialogueっぽい（簡易）
-    pat_dialogue = [
-        r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}",
-        r"発言",
-        r"質問",
-        r"答弁",
-        r"委員",
-        r"大臣",
-    ]
-    hit = _count_matches(lines[:200], pat_dialogue)
-    if hit >= 3:
-        return JudgeResult(ok=True, qa_mode="text:dialogue", confidence=0.7, reasons=["対話/ぎじろくっぽい特徴がありました"], stats={**stats, "hit": hit})
+    # E: 既にQAっぽい（Q: A: / 質問: 回答:）
+    qa_hits = _looks_like_qa_style(lines)
+    if qa_hits >= 2:
+        stats["qa_hits"] = qa_hits
+        return True, "E", 0.80, ["QA形式として判定"], stats
 
-    # 一般テキスト
+    # F: ログチケット/メールスレ（引用・ヘッダ・区切り）
+    if _looks_like_ticket_mail(text, lines):
+        return True, "F", 0.75, ["ログ/チケット/メールスレとして判定"], stats
+
+    # A: プレーンテキスト対話（話者ラベルあり）
+    sp_hits = _looks_like_speaker_dialogue(lines)
+    if sp_hits >= 2:
+        stats["speaker_hits"] = sp_hits
+        return True, "A", 0.75, ["話者ラベル付き対話として判定"], stats
+
+    # D: 単一文書（ぎじろく・レポート・FAQ未満）
     if len(lines) >= 5:
-        return JudgeResult(ok=True, qa_mode="text:generic", confidence=0.55, reasons=["一般テキストとして取り扱います"], stats=stats)
+        return True, "D", 0.60, ["単一文書として判定"], stats
 
-    return JudgeResult(ok=False, qa_mode=None, confidence=0.0, reasons=["形式が判定できません（特徴が弱い）"], stats=stats)
+    return False, None, 0.0, ["形式が判定できません（特徴が弱い）"], stats
+
+
+def judge_qa_mode(filename: str, content_type: str, text: str) -> JudgeResult:
+    ok, mode, conf, reasons, stats = _detect_mode_A_to_F(filename, content_type, text)
+    return JudgeResult(ok=ok, qa_mode=mode, confidence=conf, reasons=reasons, stats=stats)
 
 
 # -------------------------
@@ -386,6 +415,7 @@ def upload_finalize(
     upload_id = (payload.get("upload_id") or "").strip()
     filename = (payload.get("filename") or "").strip()  # 任意（UIが送るなら使う）
     content_type = (payload.get("content_type") or "").strip()  # 任意
+    kind = (payload.get("kind") or "dialogue").strip() or "dialogue"  # 任意（UIが送るなら使う）
 
     if not contract_id or not object_key or not upload_id:
         raise HTTPException(status_code=400, detail="contract_id, object_key, upload_id are required")
@@ -408,45 +438,94 @@ def upload_finalize(
 
     # 3) OK：upload_logsへINSERT（OKのときだけ）
     mk = _month_key_jst()
-    kind = "dialogue"
 
-    # DBスキーマ差を吸収
-    col = _db_has_columns(conn, "upload_logs", ["qa_mode", "confidence"])
+    # DBスキーマ差を吸収（存在する列だけ書く）
+    col = _db_has_columns(
+        conn,
+        "upload_logs",
+        [
+            "qa_mode",
+            "confidence",
+            "judge_can_extract_qa",
+            "judge_method",
+            "judge_confidence",
+            "judge_reasons",
+            "judge_stats",
+        ],
+    )
+
+    # 必須列（古いスキーマでも存在する想定）
+    cols = ["upload_id", "contract_id", "kind", "object_key", "month_key", "created_at"]
+    vals: List[Any] = [upload_id, contract_id, kind, object_key, mk]
+    created_expr = "NOW()"
+
+    # 任意列（存在するものだけ追加）
+    if col.get("qa_mode"):
+        cols.append("qa_mode")
+        vals.append(judge.qa_mode)  # "A".."F"
+
+    if col.get("confidence"):
+        cols.append("confidence")
+        vals.append(float(judge.confidence or 0.0))
+
+    if col.get("judge_can_extract_qa"):
+        cols.append("judge_can_extract_qa")
+        vals.append(True)
+
+    if col.get("judge_method"):
+        # 方式そのものを入れる（A-F）
+        cols.append("judge_method")
+        vals.append(judge.qa_mode)
+
+    if col.get("judge_confidence"):
+        cols.append("judge_confidence")
+        vals.append(float(judge.confidence or 0.0))
+
+    if col.get("judge_reasons"):
+        cols.append("judge_reasons")
+        vals.append(json.dumps(judge.reasons or [], ensure_ascii=False))
+
+    if col.get("judge_stats"):
+        cols.append("judge_stats")
+        vals.append(json.dumps(judge.stats or {}, ensure_ascii=False))
+
+    # INSERT文生成（created_at は NOW() 固定）
+    # cols: ... created_at が最後に含まれるので、そこだけ式を使う
+    col_names_sql = ", ".join(cols)
+    placeholders_sql_parts = []
+    # upload_id..month_key までは %s
+    # created_at は NOW()
+    # 追加分は %s
+    # vals は created_at を含めない（NOW() を使う）
+    base_count = 5  # upload_id, contract_id, kind, object_key, month_key
+    # cols は [.., created_at, ..optional..] だが、created_at は最後の必須として固定している
+    # → placeholdersは base_count分の%s + NOW() + optional分の%s
+    optional_count = len(vals) - base_count
+    placeholders_sql_parts.extend(["%s"] * base_count)
+    placeholders_sql_parts.append(created_expr)
+    placeholders_sql_parts.extend(["%s"] * (optional_count))
+    placeholders_sql = ", ".join(placeholders_sql_parts)
+
+    sql = f"""
+        INSERT INTO upload_logs ({col_names_sql})
+        VALUES ({placeholders_sql})
+    """
 
     try:
         with conn.cursor() as cur:
-            if col["qa_mode"] and col["confidence"]:
-                cur.execute(
-                    """
-                    INSERT INTO upload_logs
-                      (upload_id, contract_id, kind, object_key, month_key, qa_mode, confidence, created_at)
-                    VALUES
-                      (%s, %s, %s, %s, %s, %s, %s, NOW())
-                    """,
-                    (upload_id, contract_id, kind, object_key, mk, judge.qa_mode, float(judge.confidence)),
-                )
-            else:
-                # 古い定義でも落とさない（qa_mode/confidenceは保存しない）
-                cur.execute(
-                    """
-                    INSERT INTO upload_logs
-                      (upload_id, contract_id, kind, object_key, month_key, created_at)
-                    VALUES
-                      (%s, %s, %s, %s, %s, NOW())
-                    """,
-                    (upload_id, contract_id, kind, object_key, mk),
-                )
+            cur.execute(sql, tuple(vals))
         conn.commit()
     except Exception as e:
         # DB失敗時：GCSは消さない（原因調査用に残す）
         raise HTTPException(status_code=500, detail=f"failed to insert upload_logs: {e}")
 
+    # レスポンス形は従来どおり（UI側を壊さない）
     return {
         "ok": True,
         "upload_id": upload_id,
         "contract_id": contract_id,
         "object_key": object_key,
-        "qa_mode": judge.qa_mode,
+        "qa_mode": judge.qa_mode,          # ここが A-F になる
         "confidence": judge.confidence,
         "reasons": judge.reasons,
         "stats": judge.stats,
