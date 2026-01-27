@@ -170,7 +170,7 @@ def activate_dialogue(
     return {"ok": True, "contract_id": contract_id, "active_object_key": object_key}
 
 
-@router.post("/v1/admin/dialogues/build-qa")
+@router.post("/v1/qa/build")
 def build_qa(
     payload: dict,
     user=Depends(require_user),
@@ -181,7 +181,7 @@ def build_qa(
     - object_key が来ていればそれを優先
     - 無ければ contracts.active_dialogue_object_key を使う（互換）
     - upload_logs(kind='dialogue') に存在するか検証
-    - knowledge の /v1/knowledge/build-qa に POST して結果を返す（今はechoでOK）
+    - knowledge の /v1/qa/build に POST して結果を返す（今はechoでOK）
     """
     contract_id = (payload.get("contract_id") or "").strip()
     if not contract_id:
@@ -231,7 +231,7 @@ def build_qa(
 
     # 3) knowledgeへ中継
     base = _get_knowledge_base_url()
-    url = f"{base}/v1/knowledge/build-qa"
+    url = f"{base}/v1/qa/build"
 
     knowledge_body = _http_post_json(
         url,
