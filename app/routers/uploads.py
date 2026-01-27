@@ -4,6 +4,9 @@
 # 2) upload-finalize：GCSの内容をサンプル読取→QA化可否/方式判定
 #    - NG：GCS削除 + エラーメッセージ
 #    - OK：upload_logs に INSERT（OKの時だけ）
+#
+# 重要：
+# - upload_logs のスキーマが古い（qa_mode/confidenceが無い）場合でも 500 で落ちないようにフォールバックする
 
 import os
 import re
@@ -12,7 +15,7 @@ import json
 import csv
 from io import StringIO
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -48,13 +51,8 @@ def _get_bucket_name() -> str:
     raise HTTPException(status_code=500, detail="BUCKET_NAME (or UPLOAD_BUCKET) is not set")
 
 
-def _utc_now_iso() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 def _month_key_jst() -> str:
-    # 雑でOK：月単位上限のキー
-    # JST厳密が必要なら後で差し替え
+    # 月単位キー（JST厳密が必要なら後で差し替え）
     now = datetime.utcnow()
     return f"{now.year:04d}-{now.month:02d}"
 
@@ -68,10 +66,7 @@ def _ext_lower(filename: str) -> str:
 def _validate_file_meta(filename: str, size_bytes: int):
     ext = _ext_lower(filename)
     if ext not in ALLOWED_EXTS:
-        raise HTTPException(
-            status_code=400,
-            detail="許可されていないファイル形式です（.txt / .json / .csv）",
-        )
+        raise HTTPException(status_code=400, detail="許可されていないファイル形式です（.txt / .json / .csv）")
     if size_bytes > MAX_BYTES:
         raise HTTPException(status_code=400, detail="ファイルサイズが大きすぎます（上限100MB）")
     if size_bytes < MIN_BYTES:
@@ -79,7 +74,6 @@ def _validate_file_meta(filename: str, size_bytes: int):
 
 
 def _safe_name(filename: str) -> str:
-    # object_key に使う：危険文字を除去
     s = (filename or "file").strip()
     s = s.replace("/", "_").replace("\\", "_").replace("..", "_")
     s = re.sub(r"[^\w\.\-\(\)\[\]ぁ-んァ-ン一-龥]+", "_", s)
@@ -100,34 +94,26 @@ def _resolve_signer_file(path: str) -> Optional[str]:
         return path
 
     if os.path.isdir(path):
-        # 直下のファイルを優先
         try:
             entries = sorted(os.listdir(path))
         except Exception:
             entries = []
-        # jsonっぽいファイル優先
         cand = []
         for e in entries:
             p = os.path.join(path, e)
             if os.path.isfile(p):
                 cand.append(p)
-        # *.json 優先
         for p in cand:
             if p.lower().endswith(".json"):
                 return p
-        # それ以外が1個ならそれ
         if len(cand) == 1:
             return cand[0]
-        # 複数あるなら "latest" や secret名っぽいのを優先
         for p in cand:
             base = os.path.basename(p).lower()
-            if base in ("latest", "key", "credentials", "service_account.json"):
+            if base in ("latest", "key", "credentials", "service_account.json", "ank-gcs-signer"):
                 return p
-        # 最後の手段：最初の1個
         if cand:
             return cand[0]
-
-    # path が存在しない or ファイルが見つからない
     return None
 
 
@@ -141,9 +127,7 @@ def _signer_credentials_from_env_or_secret() -> service_account.Credentials:
     signer_file = _resolve_signer_file(raw)
 
     if not signer_file:
-        # デバッグしやすい情報を含める（過不足ない程度）
         detail = f"signer file not found: {raw}"
-        # raw が dir の場合は中身も出す（見える範囲）
         if os.path.isdir(raw):
             try:
                 detail += f" (dir entries={os.listdir(raw)})"
@@ -164,6 +148,7 @@ def _gcs_client_with_signer() -> storage.Client:
 
 def _gcs_read_head_text(object_key: str, max_bytes: int = 200_000) -> str:
     bucket_name = _get_bucket_name()
+    # 読み取りは実行SAでOK（必要な権限が付いている前提）
     client = storage.Client()
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(object_key)
@@ -186,6 +171,26 @@ def _gcs_delete(object_key: str):
     except Exception:
         # 削除失敗は握る（ユーザにはNGメッセージを返したい）
         pass
+
+
+def _db_has_columns(conn, table: str, cols: List[str]) -> Dict[str, bool]:
+    """
+    upload_logs の列が存在するか確認（存在しない列を INSERT して 500 になるのを避ける）
+    """
+    colset = set()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = %s
+            """,
+            (table,),
+        )
+        for row in cur.fetchall():
+            colset.add(row[0])
+    return {c: (c in colset) for c in cols}
 
 
 # -------------------------
@@ -235,7 +240,6 @@ def _try_parse_csv(text: str) -> Optional[dict]:
         rows = list(reader)
         if not rows:
             return None
-        # 1行目がヘッダっぽい
         header = rows[0]
         return {"rows": len(rows), "cols": len(header)}
     except Exception:
@@ -278,7 +282,7 @@ def judge_qa_mode(filename: str, content_type: str, text: str) -> JudgeResult:
     ]
     hit = _count_matches(lines[:200], pat_dialogue)
     if hit >= 3:
-        return JudgeResult(ok=True, qa_mode="text:dialogue", confidence=0.7, reasons=["対話/議事録っぽい特徴がありました"], stats={**stats, "hit": hit})
+        return JudgeResult(ok=True, qa_mode="text:dialogue", confidence=0.7, reasons=["対話/ぎじろくっぽい特徴がありました"], stats={**stats, "hit": hit})
 
     # 一般テキスト
     if len(lines) >= 5:
@@ -344,9 +348,9 @@ def create_upload_url(
     safe = _safe_name(req.filename)
     object_key = f"contracts/{contract_id}/{mk}/{upload_id}_{safe}"
 
-    # 5) Signed URL（ここが落ちやすいので“確実に読める signer”に寄せる）
+    # 5) Signed URL
     bucket_name = _get_bucket_name()
-    client = _gcs_client_with_signer()  # ← Secretがdirでもfileでも解決する
+    client = _gcs_client_with_signer()
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(object_key)
 
@@ -380,7 +384,7 @@ def upload_finalize(
     contract_id = (payload.get("contract_id") or "").strip()
     object_key = (payload.get("object_key") or "").strip()
     upload_id = (payload.get("upload_id") or "").strip()
-    filename = (payload.get("filename") or "").strip()  # 任意
+    filename = (payload.get("filename") or "").strip()  # 任意（UIが送るなら使う）
     content_type = (payload.get("content_type") or "").strip()  # 任意
 
     if not contract_id or not object_key or not upload_id:
@@ -406,17 +410,36 @@ def upload_finalize(
     mk = _month_key_jst()
     kind = "dialogue"
 
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO upload_logs
-              (upload_id, contract_id, kind, object_key, month_key, qa_mode, confidence, created_at)
-            VALUES
-              (%s, %s, %s, %s, %s, %s, %s, NOW())
-            """,
-            (upload_id, contract_id, kind, object_key, mk, judge.qa_mode, float(judge.confidence)),
-        )
-    conn.commit()
+    # DBスキーマ差を吸収
+    col = _db_has_columns(conn, "upload_logs", ["qa_mode", "confidence"])
+
+    try:
+        with conn.cursor() as cur:
+            if col["qa_mode"] and col["confidence"]:
+                cur.execute(
+                    """
+                    INSERT INTO upload_logs
+                      (upload_id, contract_id, kind, object_key, month_key, qa_mode, confidence, created_at)
+                    VALUES
+                      (%s, %s, %s, %s, %s, %s, %s, NOW())
+                    """,
+                    (upload_id, contract_id, kind, object_key, mk, judge.qa_mode, float(judge.confidence)),
+                )
+            else:
+                # 古い定義でも落とさない（qa_mode/confidenceは保存しない）
+                cur.execute(
+                    """
+                    INSERT INTO upload_logs
+                      (upload_id, contract_id, kind, object_key, month_key, created_at)
+                    VALUES
+                      (%s, %s, %s, %s, %s, NOW())
+                    """,
+                    (upload_id, contract_id, kind, object_key, mk),
+                )
+        conn.commit()
+    except Exception as e:
+        # DB失敗時：GCSは消さない（原因調査用に残す）
+        raise HTTPException(status_code=500, detail=f"failed to insert upload_logs: {e}")
 
     return {
         "ok": True,
