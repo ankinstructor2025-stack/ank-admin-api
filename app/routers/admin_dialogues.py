@@ -1,6 +1,10 @@
+# admin_dialogues.py
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 import os
-import requests
+import json
+import urllib.request
+import urllib.error
 
 from app.deps.auth import require_user
 from app.deps.db import get_db
@@ -12,13 +16,45 @@ router = APIRouter()
 def _get_knowledge_base_url() -> str:
     """
     admin -> knowledge の中継先。
-    環境変数 KNOWLEDGE_API_BASE_URL を優先し、無ければ同一プロジェクト内のURLを直書きしない。
+    Cloud Run の環境変数 KNOWLEDGE_API_BASE_URL に設定する。
+    例: https://ank-knowledge-api-xxxx.asia-northeast1.run.app
     """
     base = (os.environ.get("KNOWLEDGE_API_BASE_URL") or "").strip()
     if not base:
-        # ここは直書きしない。未設定なら 500 で止める（壊さないため）。
         raise HTTPException(status_code=500, detail="KNOWLEDGE_API_BASE_URL is not set")
     return base.rstrip("/")
+
+
+def _http_post_json(url: str, payload: dict, timeout_sec: int = 15) -> dict:
+    """
+    標準ライブラリだけでJSON POST。
+    失敗時は例外を投げる（呼び出し側で502にする）。
+    """
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url=url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            # JSONでなければrawで返す
+            try:
+                return json.loads(body)
+            except Exception:
+                return {"raw": body}
+    except urllib.error.HTTPError as e:
+        # knowledge側が4xx/5xx返した場合
+        raw = e.read().decode("utf-8", errors="replace")
+        try:
+            j = json.loads(raw)
+        except Exception:
+            j = {"raw": raw}
+        raise HTTPException(status_code=502, detail={"knowledge_status": e.code, "body": j})
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"failed to call knowledge api: {e}")
 
 
 @router.get("/v1/admin/dialogues")
@@ -41,7 +77,6 @@ def list_dialogues(
     items = []
 
     with conn.cursor() as cur:
-        # 現在有効な対話データ
         cur.execute(
             """
             SELECT active_dialogue_object_key
@@ -55,7 +90,6 @@ def list_dialogues(
         if row:
             active_object_key = row[0]
 
-        # 対話データの一覧
         cur.execute(
             """
             SELECT upload_id, object_key, month_key, created_at, kind
@@ -141,17 +175,17 @@ def build_qa(
     conn=Depends(get_db),
 ):
     """
-    admin UI から {contract_id, object_key} を受け取り、
-    - object_key があればそれを優先
-    - 無ければ contracts.active_dialogue_object_key を使う
-    - upload_logs に存在する dialogue object_key であることを確認
-    - knowledge API に中継して、そのレスポンスを返す（現段階は echo でOK）
+    UIから {contract_id, object_key} を受け取って knowledge に中継する。
+    - object_key が来ていればそれを優先
+    - 無ければ contracts.active_dialogue_object_key を使う（互換）
+    - upload_logs(kind='dialogue') に存在するか検証
+    - knowledge の /v1/knowledge/build-qa に POST して結果を返す（今はechoでOK）
     """
     contract_id = (payload.get("contract_id") or "").strip()
     if not contract_id:
         raise HTTPException(status_code=400, detail="contract_id is required")
 
-    object_key = (payload.get("object_key") or "").strip()  # UIが送ってくる想定
+    object_key = (payload.get("object_key") or "").strip()
 
     uid = (user.get("uid") or "").strip()
     if not uid:
@@ -159,7 +193,7 @@ def build_qa(
 
     require_contract_admin(uid, contract_id, conn)
 
-    # 1) object_key を決める（UI指定を優先）
+    # 1) object_key決定（UI指定優先 → 無ければactive）
     if not object_key:
         with conn.cursor() as cur:
             cur.execute(
@@ -177,7 +211,7 @@ def build_qa(
     if not object_key:
         raise HTTPException(status_code=409, detail="dialogue data is not selected")
 
-    # 2) upload_logs に存在するか確認（dialogue限定）
+    # 2) upload_logsに存在するか（dialogue限定）
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -193,35 +227,20 @@ def build_qa(
         if not cur.fetchone():
             raise HTTPException(status_code=404, detail="dialogue object_key not found in upload_logs")
 
-    # 3) knowledge API に中継（今は echo でもOK）
-    base_url = _get_knowledge_base_url()
-    url = f"{base_url}/v1/knowledge/build-qa"
+    # 3) knowledgeへ中継
+    base = _get_knowledge_base_url()
+    url = f"{base}/v1/knowledge/build-qa"
 
-    try:
-        # ここは「まず動かす」ため、admin側のIDトークン転送はしない（knowledge側はpublic想定）
-        # 将来: knowledge側をprivateにするなら Authorization を転送する。
-        resp = requests.post(
-            url,
-            json={"contract_id": contract_id, "object_key": object_key},
-            timeout=15,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"failed to call knowledge api: {e}")
-
-    # knowledge 側のエラーは、そのまま見える形で返す
-    ct = (resp.headers.get("content-type") or "").lower()
-    if "application/json" in ct:
-        body = resp.json()
-    else:
-        body = {"raw": resp.text}
-
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=502, detail={"knowledge_status": resp.status_code, "body": body})
+    knowledge_body = _http_post_json(
+        url,
+        {"contract_id": contract_id, "object_key": object_key},
+        timeout_sec=15,
+    )
 
     return {
         "ok": True,
         "contract_id": contract_id,
         "object_key": object_key,
         "status": "requested",
-        "knowledge": body,
+        "knowledge": knowledge_body,
     }
