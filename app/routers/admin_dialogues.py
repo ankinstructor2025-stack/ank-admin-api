@@ -24,7 +24,7 @@ def _get_knowledge_base_url() -> str:
         raise HTTPException(status_code=500, detail="KNOWLEDGE_API_BASE_URL is not set")
     return base.rstrip("/")
 
-def _http_post_json(url: str, payload: dict, timeout_sec: int = 15) -> dict:
+def _http_post_json(url: str, payload: dict, timeout_sec: int = 120) -> dict:
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url=url,
@@ -236,7 +236,7 @@ def build_qa(
     knowledge_body = _http_post_json(
         url,
         {"contract_id": contract_id, "object_key": object_key},
-        timeout_sec=15,
+        timeout_sec=120,
     )
 
     return {
