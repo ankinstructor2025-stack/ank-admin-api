@@ -91,40 +91,22 @@ def _assert_account_member(bucket, account_id: str, uid: str):
 # Pricing API (source of truth = GCS settings/pricing.json)
 # =========================
 @router.get("/v1/pricing")
-def get_pricing(user=Depends(require_user)):
-    """
-    settings/pricing.json をそのまま返す（加工しない）
-    これで「返却形式がブレる問題」を止める。
-
-    例（あなたの新ルールの入れ方）:
-      {
+def get_pricing():
+    return {
         "currency": "JPY",
         "seats": [
-          {"seat_limit":5,"monthly_fee":10000,"label":"ベーシック"},
-          {"seat_limit":10,"monthly_fee":30000,"label":"スタンダード"},
-          {"seat_limit":30,"monthly_fee":50000,"label":"プロ"}
+            {"seat_limit": 5, "monthly_fee": 10000, "label": "ベーシック"},
+            {"seat_limit": 10, "monthly_fee": 30000, "label": "スタンダード"},
+            {"seat_limit": 30, "monthly_fee": 50000, "label": "プロ"}
         ],
         "knowledge_count": [
-          {"value":1,"monthly_price":0,"label":"1"},
-          {"value":2,"monthly_price":50000,"label":"2（+50,000円）"},
-          {"value":3,"monthly_price":100000,"label":"3（+100,000円）"},
-          {"value":4,"monthly_price":150000,"label":"4（+150,000円）"},
-          {"value":5,"monthly_price":200000,"label":"5（+200,000円）"}
-        ],
-        "notes": {...}
-      }
-    """
-    # require_user でログイン必須にしておく（公開でも良いが今は統一）
-    bucket = _bucket()
-    blob = bucket.blob("settings/pricing.json")
-    if not blob.exists():
-        raise HTTPException(status_code=404, detail="settings/pricing.json not found")
-
-    try:
-        return json.loads(blob.download_as_text(encoding="utf-8"))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"pricing.json read error: {e}")
-
+            {"value": 1, "monthly_price": 0, "label": "1"},
+            {"value": 2, "monthly_price": 50000, "label": "2"},
+            {"value": 3, "monthly_price": 100000, "label": "3"},
+            {"value": 4, "monthly_price": 150000, "label": "4"},
+            {"value": 5, "monthly_price": 200000, "label": "5"}
+        ]
+    }
 
 # =========================
 # SQLite init (契約保存時に作る)
