@@ -1,6 +1,7 @@
 import os
 import json
 import uuid
+import sqlite3
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -58,22 +59,73 @@ def _upload_json(bucket, path: str, data: dict, *, if_generation_match=None):
     return blob
 
 
+# ==========
+# SQLite init
+# ==========
+
+_SCHEMA_SQL = """
+PRAGMA journal_mode=WAL;
+
+CREATE TABLE IF NOT EXISTS meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS knowledge_files (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  object_key TEXT NOT NULL,
+  filename TEXT NOT NULL,
+  status TEXT NOT NULL,      -- uploaded / processed / error
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS qa (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  question TEXT NOT NULL,
+  answer TEXT NOT NULL,
+  source_key TEXT,
+  created_at TEXT NOT NULL
+);
+
+INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '1');
+"""
+
+def _create_sqlite_file(local_path: str, *, contract_id: str, role: str):
+    # role: "write" or "read"
+    conn = sqlite3.connect(local_path)
+    try:
+        cur = conn.cursor()
+        cur.executescript(_SCHEMA_SQL)
+        cur.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", ("contract_id", contract_id))
+        cur.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", ("db_role", role))
+        cur.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", ("created_at", _now_iso()))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _upload_file(bucket, gcs_path: str, local_path: str):
+    blob = bucket.blob(gcs_path)
+    # SQLiteはapplication/x-sqlite3でもよいが、octet-streamで十分
+    blob.upload_from_filename(local_path, content_type="application/octet-stream")
+    return blob
+
+
 @router.post("/v1/contract")
 def create_contract(
     payload: ContractCreate,
     user=Depends(require_user),
 ):
     """
-    旧: Cloud SQL の users / contracts / user_contracts にINSERT
-    新: GCS に契約フォルダと初期ファイルを作成
+    新: GCS に契約フォルダと初期ファイルを作成（DBはSQLiteを生成してアップロード）
 
     作成物:
       tenants/{contract_id}/.keep
       tenants/{contract_id}/contract.json
       tenants/{contract_id}/members/{uid}.json
       tenants/{contract_id}/meta.json
-      tenants/{contract_id}/db/read.db   (空のプレースホルダ)
-      tenants/{contract_id}/db/write.db  (空のプレースホルダ)
+      tenants/{contract_id}/db/read.db    (SQLite実体)
+      tenants/{contract_id}/db/write.db   (SQLite実体)
     """
     uid = (user.get("uid") or "").strip()
     if not uid:
@@ -88,12 +140,10 @@ def create_contract(
     if not email:
         raise HTTPException(status_code=400, detail="email is required")
 
-    # contract_id はファイル階層に使うので、ハイフン無しhexにしておく
     contract_id = uuid.uuid4().hex
     now = _now_iso()
 
     bucket = _bucket()
-
     base = f"tenants/{contract_id}/"
 
     # 1) “フォルダ”作成（.keep）
@@ -105,10 +155,10 @@ def create_contract(
     contract = {
         "contract_id": contract_id,
         "status": "active",
-        "start_at": now,  # DBのNOW()相当
+        "start_at": now,
         "seat_limit": int(payload.seat_limit),
         "knowledge_count": int(payload.knowledge_count),
-        "payment_method_configured": False,  # 旧contractsと合わせる
+        "payment_method_configured": False,
         "monthly_amount_yen": int(payload.monthly_amount_yen),
         "note": (payload.note or "").strip() or None,
         "created_at": now,
@@ -123,8 +173,6 @@ def create_contract(
     _upload_json(bucket, base + "contract.json", contract)
 
     # 3) members/{uid}.json（owner/adminの起点）
-    # 旧実装では user_contracts に role='admin' で入れてたので、
-    # ファイルでは owner として保存（ownerは別枠、admin枠5は後で追加）
     member = {
         "uid": uid,
         "email": email,
@@ -150,12 +198,24 @@ def create_contract(
     }
     _upload_json(bucket, base + "meta.json", meta)
 
-    # 5) DBプレースホルダ（実体は後で ank-knowledge-api が作る/差し替える）
-    bucket.blob(base + "db/read.db").upload_from_string(
-        b"", content_type="application/octet-stream"
-    )
-    bucket.blob(base + "db/write.db").upload_from_string(
-        b"", content_type="application/octet-stream"
-    )
+    # 5) SQLite を生成してアップロード（0Bプレースホルダは作らない）
+    tmp_write = f"/tmp/{contract_id}_write.db"
+    tmp_read = f"/tmp/{contract_id}_read.db"
+
+    _create_sqlite_file(tmp_write, contract_id=contract_id, role="write")
+    _create_sqlite_file(tmp_read, contract_id=contract_id, role="read")
+
+    _upload_file(bucket, base + "db/write.db", tmp_write)
+    _upload_file(bucket, base + "db/read.db", tmp_read)
+
+    # /tmp を掃除（任意：なくても良いが、明示するなら）
+    try:
+        os.remove(tmp_write)
+    except Exception:
+        pass
+    try:
+        os.remove(tmp_read)
+    except Exception:
+        pass
 
     return {"contract_id": contract_id, "status": "active"}
