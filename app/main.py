@@ -11,6 +11,7 @@ from app.routers.judge_method import router as judge_method_router
 from app.routers.admin_dialogues import router as admin_dialogues_router
 from app.routers.contract_create import router as contract_create_router
 from app.routers.accounts import router as accounts_router
+from app.routers.tenants import router as tenants_router
 
 def create_app() -> FastAPI:
     app = FastAPI()
@@ -37,6 +38,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_dialogues_router)
     app.include_router(contract_create_router)
     app.include_router(accounts_router)
+    app.include_router(tenants_router)
 
     return app
 
