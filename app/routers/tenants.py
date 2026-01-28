@@ -91,22 +91,38 @@ def _assert_account_member(bucket, account_id: str, uid: str):
 # Pricing API (source of truth = GCS settings/pricing.json)
 # =========================
 @router.get("/v1/pricing")
-def get_pricing():
-    return {
-        "currency": "JPY",
-        "seats": [
-            {"seat_limit": 5, "monthly_fee": 10000, "label": "ベーシック"},
-            {"seat_limit": 10, "monthly_fee": 30000, "label": "スタンダード"},
-            {"seat_limit": 30, "monthly_fee": 50000, "label": "プロ"}
-        ],
-        "knowledge_count": [
-            {"value": 1, "monthly_price": 0, "label": "1"},
-            {"value": 2, "monthly_price": 50000, "label": "2"},
-            {"value": 3, "monthly_price": 100000, "label": "3"},
-            {"value": 4, "monthly_price": 150000, "label": "4"},
-            {"value": 5, "monthly_price": 200000, "label": "5"}
-        ]
-    }
+def get_pricing(user=Depends(require_user)):
+    """
+    settings/pricing.json をそのまま返す（加工しない）
+
+    重要:
+    - seats / knowledge_count が空のまま返ると UI が詰むので、
+      空なら 500 で止めて原因を明確にする。
+    """
+    bucket = _bucket()
+    gcs_path = "settings/pricing.json"
+    blob = bucket.blob(gcs_path)
+    if not blob.exists():
+        raise HTTPException(status_code=404, detail=f"{gcs_path} not found in bucket={bucket.name}")
+
+    try:
+        data = json.loads(blob.download_as_text(encoding="utf-8"))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"pricing.json read error: {e}")
+
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=500, detail="pricing.json must be an object")
+
+    seats = data.get("seats") or []
+    kc = data.get("knowledge_count") or []
+    if not isinstance(seats, list) or not isinstance(kc, list) or (len(seats) == 0) or (len(kc) == 0):
+        raise HTTPException(
+            status_code=500,
+            detail=f"pricing.json is empty (seats/knowledge_count). Please update gs://{bucket.name}/{gcs_path}",
+        )
+
+    return data
+
 
 # =========================
 # SQLite init (契約保存時に作る)
