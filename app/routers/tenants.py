@@ -45,6 +45,51 @@ def list_tenants(
     tenants.sort(key=lambda x: x["tenant_id"])
     return {"tenants": tenants}
 
+@router.get("/v1/tenant")
+def get_tenant(
+    tenant_id: str = Query(...),
+    account_id: str = Query(""),
+    user=Depends(require_user),
+):
+    uid = user.get("uid")
+    if not uid:
+        raise HTTPException(status_code=400, detail="no uid")
+
+    bucket = _bucket()
+
+    # account_id が来ているなら、それを優先して読む（速い）
+    if account_id:
+        path = f"accounts/{account_id}/tenants/{tenant_id}/tenant.json"
+        blob = bucket.blob(path)
+        if blob.exists():
+            data = json.loads(blob.download_as_text())
+            return {
+                "tenant_id": data.get("tenant_id", tenant_id),
+                "account_id": data.get("account_id", account_id),
+                "name": data.get("name", ""),
+                "status": data.get("status", "active"),
+            }
+
+    # account_id が無い場合は user索引から引く（後で強化）
+    # まずは user 側に tenants/<tenant_id>.json がある想定
+    idx_path = f"users/{uid}/tenants/{tenant_id}.json"
+    idx_blob = bucket.blob(idx_path)
+    if not idx_blob.exists():
+        raise HTTPException(status_code=404, detail="tenant not found for user")
+
+    idx = json.loads(idx_blob.download_as_text())
+    aid = idx.get("account_id") or ""
+    if not aid:
+        raise HTTPException(status_code=500, detail="tenant index missing account_id")
+
+    path = f"accounts/{aid}/tenants/{tenant_id}/tenant.json"
+    data = json.loads(bucket.blob(path).download_as_text())
+    return {
+        "tenant_id": data.get("tenant_id", tenant_id),
+        "account_id": data.get("account_id", aid),
+        "name": data.get("name", ""),
+        "status": data.get("status", "active"),
+    }
 
 @router.post("/v1/tenant")
 def create_tenant(
