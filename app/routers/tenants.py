@@ -1,142 +1,86 @@
-from __future__ import annotations
-
 import json
-import uuid
 from datetime import datetime, timezone
-
-from fastapi import APIRouter, Depends, HTTPException, Query
-from google.cloud import storage
-
+from fastapi import HTTPException, Depends
 from app.deps.auth import require_user
-from app.core.settings import BUCKET_NAME
 
-router = APIRouter()
-_storage = storage.Client()
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
 
-
-def _bucket():
-    if not BUCKET_NAME:
-        raise HTTPException(status_code=500, detail="UPLOAD_BUCKET is not set")
-    return _storage.bucket(BUCKET_NAME)
-
-
-@router.get("/v1/tenants")
-def list_tenants(
-    account_id: str = Query(...),
-    user=Depends(require_user),
-):
+@router.post("/v1/tenant/contract")
+def upsert_tenant_contract(payload: dict, user=Depends(require_user)):
     uid = user.get("uid")
     if not uid:
         raise HTTPException(status_code=400, detail="no uid")
 
-    bucket = _bucket()
-    prefix = f"accounts/{account_id}/tenants/"
-
-    tenants = []
-    for b in _storage.list_blobs(bucket, prefix=prefix):
-        if not b.name.endswith("/tenant.json"):
-            continue
-        data = json.loads(b.download_as_text())
-        tenants.append({
-            "tenant_id": data["tenant_id"],
-            "name": data.get("name")
-        })
-
-    tenants.sort(key=lambda x: x["tenant_id"])
-    return {"tenants": tenants}
-
-@router.get("/v1/tenant")
-def get_tenant(
-    tenant_id: str = Query(...),
-    account_id: str = Query(""),
-    user=Depends(require_user),
-):
-    uid = user.get("uid")
-    if not uid:
-        raise HTTPException(status_code=400, detail="no uid")
-
-    bucket = _bucket()
-
-    # account_id が来ているなら、それを優先して読む（速い）
-    if account_id:
-        path = f"accounts/{account_id}/tenants/{tenant_id}/tenant.json"
-        blob = bucket.blob(path)
-        if blob.exists():
-            data = json.loads(blob.download_as_text())
-            return {
-                "tenant_id": data.get("tenant_id", tenant_id),
-                "account_id": data.get("account_id", account_id),
-                "name": data.get("name", ""),
-                "status": data.get("status", "active"),
-            }
-
-    # account_id が無い場合は user索引から引く（後で強化）
-    # まずは user 側に tenants/<tenant_id>.json がある想定
-    idx_path = f"users/{uid}/tenants/{tenant_id}.json"
-    idx_blob = bucket.blob(idx_path)
-    if not idx_blob.exists():
-        raise HTTPException(status_code=404, detail="tenant not found for user")
-
-    idx = json.loads(idx_blob.download_as_text())
-    aid = idx.get("account_id") or ""
-    if not aid:
-        raise HTTPException(status_code=500, detail="tenant index missing account_id")
-
-    path = f"accounts/{aid}/tenants/{tenant_id}/tenant.json"
-    data = json.loads(bucket.blob(path).download_as_text())
-    return {
-        "tenant_id": data.get("tenant_id", tenant_id),
-        "account_id": data.get("account_id", aid),
-        "name": data.get("name", ""),
-        "status": data.get("status", "active"),
-    }
-
-@router.post("/v1/tenant")
-def create_tenant(
-    payload: dict,
-    user=Depends(require_user),
-):
-    uid = user.get("uid")
-    if not uid:
-        raise HTTPException(status_code=400, detail="no uid")
-
+    tenant_id = (payload.get("tenant_id") or "").strip()
     account_id = (payload.get("account_id") or "").strip()
+    if not tenant_id:
+        raise HTTPException(status_code=400, detail="tenant_id required")
     if not account_id:
         raise HTTPException(status_code=400, detail="account_id required")
 
-    name = (payload.get("name") or "").strip()
+    seat_limit = int(payload.get("seat_limit") or 0)
+    knowledge_count = int(payload.get("knowledge_count") or 0)
+    monthly_amount_yen = payload.get("monthly_amount_yen")
+    note = (payload.get("note") or "").strip()
+    contract_status = (payload.get("contract_status") or "draft").strip()
+
+    if monthly_amount_yen is None:
+        raise HTTPException(status_code=400, detail="monthly_amount_yen required")
 
     bucket = _bucket()
+    path = f"accounts/{account_id}/tenants/{tenant_id}/tenant.json"
+    blob = bucket.blob(path)
+    if not blob.exists():
+        raise HTTPException(status_code=404, detail="tenant not found")
 
-    tenant_id = f"ten_{uuid.uuid4().hex[:12]}"
-    now = datetime.now(timezone.utc).isoformat()
+    data = json.loads(blob.download_as_text(encoding="utf-8"))
+    now = _now_iso()
 
-    # tenant 実体
-    bucket.blob(
-        f"accounts/{account_id}/tenants/{tenant_id}/tenant.json"
-    ).upload_from_string(
-        json.dumps({
-            "tenant_id": tenant_id,
-            "account_id": account_id,
-            "name": name,
-            "created_at": now
-        }, ensure_ascii=False),
-        content_type="application/json"
+    data["seat_limit"] = seat_limit
+    data["knowledge_count"] = knowledge_count
+    data["monthly_amount_yen"] = int(monthly_amount_yen)
+    data["note"] = note or None
+    data["contract_status"] = contract_status
+    data["updated_at"] = now
+    if contract_status == "active" and not data.get("activated_at"):
+        data["activated_at"] = now
+
+    blob.upload_from_string(
+        json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        content_type="application/json; charset=utf-8"
     )
 
-    # user 側索引（任意だが後で効く）
-    bucket.blob(
-        f"users/{uid}/tenants/{tenant_id}.json"
-    ).upload_from_string(
-        json.dumps({
-            "tenant_id": tenant_id,
-            "account_id": account_id,
-            "role": "admin",
-            "created_at": now
-        }, ensure_ascii=False),
-        content_type="application/json"
+    return {"ok": True}
+
+@router.post("/v1/tenant/mark-paid")
+def mark_paid(payload: dict, user=Depends(require_user)):
+    uid = user.get("uid")
+    if not uid:
+        raise HTTPException(status_code=400, detail="no uid")
+
+    tenant_id = (payload.get("tenant_id") or "").strip()
+    account_id = (payload.get("account_id") or "").strip()
+    if not tenant_id:
+        raise HTTPException(status_code=400, detail="tenant_id required")
+    if not account_id:
+        raise HTTPException(status_code=400, detail="account_id required")
+
+    bucket = _bucket()
+    path = f"accounts/{account_id}/tenants/{tenant_id}/tenant.json"
+    blob = bucket.blob(path)
+    if not blob.exists():
+        raise HTTPException(status_code=404, detail="tenant not found")
+
+    data = json.loads(blob.download_as_text(encoding="utf-8"))
+    now = _now_iso()
+
+    data["payment_method_configured"] = True
+    data["updated_at"] = now
+
+    blob.upload_from_string(
+        json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        content_type="application/json; charset=utf-8"
     )
 
-    return {
-        "tenant_id": tenant_id
-    }
+    return {"ok": True}
