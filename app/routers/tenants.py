@@ -644,3 +644,82 @@ def get_my_single_tenant(
         "tenant_id": found_tenant_id,
         "plan_id": plan_id,
     }
+
+@router.post("/v1/tenant/contract")
+def upsert_tenant_contract(
+    payload: dict,
+    user=Depends(require_user),
+):
+    """
+    契約内容の保存
+    - 支払い前(payment_method_configured=false)は何度でも更新可
+    - 支払い後(payment_method_configured=true)は更新不可（400）
+    - 保存時に SQLite(write/read) を生成（無い/0Bのみ。上書きしない）
+
+    payload:
+      account_id, tenant_id, seat_limit, knowledge_count, monthly_amount_yen, note?, plan_id?
+    """
+    uid = (user.get("uid") or "").strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="no uid")
+
+    tenant_id = (payload.get("tenant_id") or "").strip()
+    account_id = (payload.get("account_id") or "").strip()
+    if not tenant_id:
+        raise HTTPException(status_code=400, detail="tenant_id required")
+    if not account_id:
+        raise HTTPException(status_code=400, detail="account_id required")
+
+    try:
+        seat_limit = int(payload.get("seat_limit"))
+        knowledge_count = int(payload.get("knowledge_count"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="seat_limit/knowledge_count must be int")
+
+    monthly_amount_yen = payload.get("monthly_amount_yen", None)
+    if monthly_amount_yen is None:
+        raise HTTPException(status_code=400, detail="monthly_amount_yen required")
+    try:
+        monthly_amount_yen = int(monthly_amount_yen)
+    except Exception:
+        raise HTTPException(status_code=400, detail="monthly_amount_yen must be int")
+
+    note = (payload.get("note") or "").strip()
+    plan_id = (payload.get("plan_id") or "").strip() or None
+
+    bucket = _bucket()
+    _assert_account_member(bucket, account_id, uid)
+
+    limits = _read_system_limits(bucket)
+    max_seat = int(limits.get("max_seat_limit") or 0)
+    max_kc = int(limits.get("max_knowledge_count") or 0)
+
+    if max_seat and seat_limit > max_seat:
+        raise HTTPException(status_code=400, detail="seat_limit exceeds system limit")
+    if max_kc and knowledge_count > max_kc:
+        raise HTTPException(status_code=400, detail="knowledge_count exceeds system limit")
+
+    path = f"accounts/{account_id}/tenants/{tenant_id}/tenant.json"
+    data = _read_json(bucket, path)
+
+    # 支払い後は変更不可
+    if bool(data.get("payment_method_configured")):
+        raise HTTPException(status_code=400, detail="contract is locked (payment configured)")
+
+    now = _now_iso()
+    data["seat_limit"] = seat_limit
+    data["knowledge_count"] = knowledge_count
+    data["monthly_amount_yen"] = monthly_amount_yen
+    data["note"] = note or None
+    data["plan_id"] = plan_id
+    data["updated_at"] = now
+
+    if not data.get("contract_saved_at"):
+        data["contract_saved_at"] = now
+
+    _write_json(bucket, path, data)
+
+    # 契約保存時にDBを作る（無い/0Bのみ）
+    _ensure_tenant_sqlite_dbs(bucket, account_id=account_id, tenant_id=tenant_id)
+
+    return {"ok": True}
