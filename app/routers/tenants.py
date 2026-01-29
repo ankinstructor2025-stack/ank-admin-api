@@ -259,6 +259,26 @@ def _ensure_tenant_sqlite_dbs(bucket, *, account_id: str, tenant_id: str):
 
 
 # =========================
+# Contract helpers (GCS)
+# =========================
+def _contract_path(account_id: str, tenant_id: str) -> str:
+    return f"accounts/{account_id}/tenants/{tenant_id}/contract.json"
+
+
+def _read_contract(bucket, account_id: str, tenant_id: str) -> Optional[dict]:
+    path = _contract_path(account_id, tenant_id)
+    blob = bucket.blob(path)
+    if not blob.exists():
+        return None
+    return _read_json(bucket, path)
+
+
+def _write_contract(bucket, account_id: str, tenant_id: str, data: dict):
+    path = _contract_path(account_id, tenant_id)
+    _write_json(bucket, path, data)
+
+
+# =========================
 # Tenants APIs
 # =========================
 @router.get("/v1/tenants")
@@ -298,6 +318,7 @@ def list_tenants(
                 "monthly_amount_yen": data.get("monthly_amount_yen"),
                 "plan_id": data.get("plan_id"),
                 "note": data.get("note"),
+                "contract_id": data.get("contract_id"),  # 追加（無ければNone）
             }
         )
 
@@ -353,6 +374,7 @@ def create_tenant(
         "monthly_amount_yen": None,
         "plan_id": None,
         "note": None,
+        "contract_id": None,
         "created_at": now,
         "updated_at": now,
     }
@@ -404,23 +426,163 @@ def get_tenant(
     return _read_json(bucket, f"accounts/{aid}/tenants/{tenant_id}/tenant.json")
 
 
+# =========================
+# NEW: Contract API (tenant + contract を作る/更新する)
+# =========================
+@router.post("/v1/contract")
+def create_or_update_contract(
+    payload: dict,
+    user=Depends(require_user),
+):
+    """
+    目的：
+      - 「このプランで契約」押下で tenant と contract を 1:1 で作る/更新する
+
+    入力：
+      account_id, plan_id, note?
+      tenant_id は任意（無ければ新規作成）
+      monthly_amount_yen は plans.json の monthly_price を使う（payloadは信用しない）
+
+    出力：
+      { tenant_id, contract_id }
+    """
+    uid = (user.get("uid") or "").strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="no uid")
+
+    account_id = (payload.get("account_id") or "").strip()
+    if not account_id:
+        raise HTTPException(status_code=400, detail="account_id required")
+
+    plan_id = (payload.get("plan_id") or "").strip()
+    if not plan_id:
+        raise HTTPException(status_code=400, detail="plan_id required")
+
+    note = (payload.get("note") or "").strip() or None
+    tenant_id = (payload.get("tenant_id") or "").strip() or None
+
+    bucket = _bucket()
+    _assert_account_member(bucket, account_id, uid)
+
+    # plan 検証 & 月額はplans.json由来
+    plans_obj = _read_plans(bucket)
+    plan = _find_plan(plans_obj, plan_id)
+    if not plan:
+        raise HTTPException(status_code=400, detail=f"unknown plan_id: {plan_id}")
+    monthly_amount_yen = _plan_monthly_price(plan)
+
+    limits = _read_system_limits(bucket)
+    max_tenants = int(limits.get("max_tenants_per_account") or 0)
+
+    now = _now_iso()
+
+    # tenant_id が無ければ tenant を新規作成
+    if not tenant_id:
+        if max_tenants:
+            prefix = f"accounts/{account_id}/tenants/"
+            count = 0
+            for b in _storage.list_blobs(bucket, prefix=prefix):
+                if b.name.endswith("/tenant.json"):
+                    count += 1
+                    if count >= max_tenants:
+                        raise HTTPException(status_code=400, detail="tenant count limit reached")
+
+        tenant_id = f"ten_{uuid.uuid4().hex[:12]}"
+        tenant = {
+            "tenant_id": tenant_id,
+            "account_id": account_id,
+            "name": "",
+            "status": "active",
+            "payment_method_configured": False,
+            "seat_limit": None,
+            "knowledge_count": None,
+            "monthly_amount_yen": monthly_amount_yen,
+            "plan_id": plan_id,
+            "note": note,
+            "contract_id": None,  # 後で入れる
+            "created_at": now,
+            "updated_at": now,
+            "contract_saved_at": now,
+        }
+        _write_json(bucket, f"accounts/{account_id}/tenants/{tenant_id}/tenant.json", tenant)
+
+        user_index = {
+            "tenant_id": tenant_id,
+            "account_id": account_id,
+            "role": "admin",
+            "status": "active",
+            "created_at": now,
+        }
+        _write_json(bucket, f"users/{uid}/tenants/{tenant_id}.json", user_index)
+
+    # 既存tenantを読み込み
+    tenant_path = f"accounts/{account_id}/tenants/{tenant_id}/tenant.json"
+    tenant = _read_json(bucket, tenant_path)
+
+    # 支払い後は契約変更不可（「作成」だけは初回なのでここに来る前にtenantが無い）
+    if bool(tenant.get("payment_method_configured")):
+        raise HTTPException(status_code=400, detail="contract is locked (payment configured)")
+
+    # contract.json（1:1）を作成/更新
+    contract = _read_contract(bucket, account_id, tenant_id)
+    if not contract:
+        contract_id = f"con_{uuid.uuid4().hex[:12]}"
+        contract = {
+            "contract_id": contract_id,
+            "tenant_id": tenant_id,
+            "account_id": account_id,
+            "status": "active",
+            "plan_id": plan_id,
+            "monthly_amount_yen": monthly_amount_yen,
+            "note": note,
+            "created_at": now,
+            "updated_at": now,
+        }
+    else:
+        contract_id = (contract.get("contract_id") or "").strip() or f"con_{uuid.uuid4().hex[:12]}"
+        contract["contract_id"] = contract_id
+        contract["status"] = "active"
+        contract["plan_id"] = plan_id
+        contract["monthly_amount_yen"] = monthly_amount_yen
+        contract["note"] = note
+        contract["updated_at"] = now
+
+    _write_contract(bucket, account_id, tenant_id, contract)
+
+    # tenant.json にも反映（UI表示用/検索用）
+    tenant["plan_id"] = plan_id
+    tenant["monthly_amount_yen"] = monthly_amount_yen
+    tenant["note"] = note
+    tenant["contract_id"] = contract_id
+    tenant["updated_at"] = now
+    if not tenant.get("contract_saved_at"):
+        tenant["contract_saved_at"] = now
+    _write_json(bucket, tenant_path, tenant)
+
+    # requires_db=true のときだけDB生成
+    if _plan_requires_db(plan):
+        _ensure_tenant_sqlite_dbs(bucket, account_id=account_id, tenant_id=tenant_id)
+
+    return {"tenant_id": tenant_id, "contract_id": contract_id}
+
+
+# =========================
+# Backward compatible: /v1/tenant/contract (tenant更新＋必要ならDB生成)
+# =========================
 @router.post("/v1/tenant/contract")
 def upsert_tenant_contract(
     payload: dict,
     user=Depends(require_user),
 ):
     """
-    契約内容の保存
-    - 支払い前(payment_method_configured=false)は更新可
-    - 支払い後(payment_method_configured=true)は更新不可（400）
-    - DB(write/read) は plan の requires_db=true のときだけ生成（無い/0Bのみ。上書きしない）
+    互換用：tenant_id が既にある前提で、契約情報を更新する。
 
-    入力（新方式）:
+    新方式：
       account_id, tenant_id, plan_id, note?
-      monthly_amount_yen は plans.json の monthly_price を使う（payloadの値は信用しない）
+      monthly_amount_yen は plans.json の monthly_price を使う（payloadは信用しない）
 
-    入力（旧互換）:
-      account_id, tenant_id, seat_limit, knowledge_count, monthly_amount_yen, note?, plan_id?
+    旧方式（plan_id無し）：
+      account_id, tenant_id, seat_limit, knowledge_count, monthly_amount_yen, note?
     """
     uid = (user.get("uid") or "").strip()
     if not uid:
@@ -433,29 +595,27 @@ def upsert_tenant_contract(
     if not account_id:
         raise HTTPException(status_code=400, detail="account_id required")
 
-    note = (payload.get("note") or "").strip()
+    note = (payload.get("note") or "").strip() or None
     plan_id = (payload.get("plan_id") or "").strip() or None
 
     bucket = _bucket()
     _assert_account_member(bucket, account_id, uid)
 
-    path = f"accounts/{account_id}/tenants/{tenant_id}/tenant.json"
-    data = _read_json(bucket, path)
+    tenant_path = f"accounts/{account_id}/tenants/{tenant_id}/tenant.json"
+    tenant = _read_json(bucket, tenant_path)
 
-    # 支払い後は変更不可
-    if bool(data.get("payment_method_configured")):
+    if bool(tenant.get("payment_method_configured")):
         raise HTTPException(status_code=400, detail="contract is locked (payment configured)")
 
     limits = _read_system_limits(bucket)
     max_seat = int(limits.get("max_seat_limit") or 0)
     max_kc = int(limits.get("max_knowledge_count") or 0)
 
+    now = _now_iso()
+
     # -------------------------
     # 新方式：plan_id 優先
     # -------------------------
-    seat_limit: Optional[int] = None
-    knowledge_count: Optional[int] = None
-
     if plan_id:
         plans_obj = _read_plans(bucket)
         plan = _find_plan(plans_obj, plan_id)
@@ -464,7 +624,9 @@ def upsert_tenant_contract(
 
         monthly_amount_yen = _plan_monthly_price(plan)
 
-        # seat_limit / knowledge_count は任意（旧互換で送られてきたら保存する）
+        seat_limit: Optional[int] = None
+        knowledge_count: Optional[int] = None
+
         if payload.get("seat_limit") is not None:
             try:
                 seat_limit = int(payload.get("seat_limit"))
@@ -476,37 +638,58 @@ def upsert_tenant_contract(
             except Exception:
                 raise HTTPException(status_code=400, detail="knowledge_count must be int")
 
-        # システム上限チェック（値がある場合のみ）
         if seat_limit is not None and max_seat and seat_limit > max_seat:
             raise HTTPException(status_code=400, detail="seat_limit exceeds system limit")
         if knowledge_count is not None and max_kc and knowledge_count > max_kc:
             raise HTTPException(status_code=400, detail="knowledge_count exceeds system limit")
 
-        now = _now_iso()
-        data["plan_id"] = plan_id
-        data["monthly_amount_yen"] = monthly_amount_yen
-        data["note"] = note or None
-        data["updated_at"] = now
+        # contract.json も更新（1:1）
+        contract = _read_contract(bucket, account_id, tenant_id)
+        if not contract:
+            contract_id = f"con_{uuid.uuid4().hex[:12]}"
+            contract = {
+                "contract_id": contract_id,
+                "tenant_id": tenant_id,
+                "account_id": account_id,
+                "status": "active",
+                "plan_id": plan_id,
+                "monthly_amount_yen": monthly_amount_yen,
+                "note": note,
+                "created_at": now,
+                "updated_at": now,
+            }
+        else:
+            contract_id = (contract.get("contract_id") or "").strip() or f"con_{uuid.uuid4().hex[:12]}"
+            contract["contract_id"] = contract_id
+            contract["status"] = "active"
+            contract["plan_id"] = plan_id
+            contract["monthly_amount_yen"] = monthly_amount_yen
+            contract["note"] = note
+            contract["updated_at"] = now
 
-        # 任意項目（入ってきた場合のみ更新）
+        _write_contract(bucket, account_id, tenant_id, contract)
+
+        tenant["plan_id"] = plan_id
+        tenant["monthly_amount_yen"] = monthly_amount_yen
+        tenant["note"] = note
+        tenant["contract_id"] = contract_id
+        tenant["updated_at"] = now
         if seat_limit is not None:
-            data["seat_limit"] = seat_limit
+            tenant["seat_limit"] = seat_limit
         if knowledge_count is not None:
-            data["knowledge_count"] = knowledge_count
+            tenant["knowledge_count"] = knowledge_count
+        if not tenant.get("contract_saved_at"):
+            tenant["contract_saved_at"] = now
 
-        if not data.get("contract_saved_at"):
-            data["contract_saved_at"] = now
+        _write_json(bucket, tenant_path, tenant)
 
-        _write_json(bucket, path, data)
-
-        # requires_db=true のときだけDB作成
         if _plan_requires_db(plan):
             _ensure_tenant_sqlite_dbs(bucket, account_id=account_id, tenant_id=tenant_id)
 
         return {"ok": True}
 
     # -------------------------
-    # 旧互換：plan_id が無い場合は従来どおり必須
+    # 旧互換：plan_id が無い場合
     # -------------------------
     try:
         seat_limit = int(payload.get("seat_limit"))
@@ -527,20 +710,18 @@ def upsert_tenant_contract(
     if max_kc and knowledge_count > max_kc:
         raise HTTPException(status_code=400, detail="knowledge_count exceeds system limit")
 
-    now = _now_iso()
-    data["seat_limit"] = seat_limit
-    data["knowledge_count"] = knowledge_count
-    data["monthly_amount_yen"] = monthly_amount_yen
-    data["note"] = note or None
-    data["plan_id"] = None
-    data["updated_at"] = now
+    # contract.json は旧方式だとplan_id無しなので、tenantの反映だけ（必要なら後で統一）
+    tenant["seat_limit"] = seat_limit
+    tenant["knowledge_count"] = knowledge_count
+    tenant["monthly_amount_yen"] = monthly_amount_yen
+    tenant["note"] = note
+    tenant["plan_id"] = None
+    tenant["updated_at"] = now
+    if not tenant.get("contract_saved_at"):
+        tenant["contract_saved_at"] = now
 
-    if not data.get("contract_saved_at"):
-        data["contract_saved_at"] = now
+    _write_json(bucket, tenant_path, tenant)
 
-    _write_json(bucket, path, data)
-
-    # 旧方式は従来どおりDB作成
     _ensure_tenant_sqlite_dbs(bucket, account_id=account_id, tenant_id=tenant_id)
 
     return {"ok": True}
@@ -583,6 +764,7 @@ def mark_paid(
     _write_json(bucket, path, data)
     return {"ok": True}
 
+
 @router.get("/v1/my/tenant")
 def get_my_single_tenant(
     account_id: str = Query(...),
@@ -606,12 +788,10 @@ def get_my_single_tenant(
 
     bucket = _bucket()
 
-    # 逆引き（ユーザー→テナント）から探す
     prefix = f"users/{uid}/tenants/"
     found_tenant_id = None
 
     for b in _storage.list_blobs(bucket, prefix=prefix):
-        # users/<uid>/tenants/<tenant_id>.json だけを見る
         if not b.name.endswith(".json"):
             continue
 
@@ -633,7 +813,6 @@ def get_my_single_tenant(
     if not found_tenant_id:
         return {"exists": False, "account_id": account_id}
 
-    # tenant本体から plan_id を取る（accounts配下はsource of truth）
     tenant_path = f"accounts/{account_id}/tenants/{found_tenant_id}/tenant.json"
     t = _read_json(bucket, tenant_path)
     plan_id = (t.get("plan_id") or "").strip() or None
@@ -644,82 +823,3 @@ def get_my_single_tenant(
         "tenant_id": found_tenant_id,
         "plan_id": plan_id,
     }
-
-@router.post("/v1/tenant/contract")
-def upsert_tenant_contract(
-    payload: dict,
-    user=Depends(require_user),
-):
-    """
-    契約内容の保存
-    - 支払い前(payment_method_configured=false)は何度でも更新可
-    - 支払い後(payment_method_configured=true)は更新不可（400）
-    - 保存時に SQLite(write/read) を生成（無い/0Bのみ。上書きしない）
-
-    payload:
-      account_id, tenant_id, seat_limit, knowledge_count, monthly_amount_yen, note?, plan_id?
-    """
-    uid = (user.get("uid") or "").strip()
-    if not uid:
-        raise HTTPException(status_code=400, detail="no uid")
-
-    tenant_id = (payload.get("tenant_id") or "").strip()
-    account_id = (payload.get("account_id") or "").strip()
-    if not tenant_id:
-        raise HTTPException(status_code=400, detail="tenant_id required")
-    if not account_id:
-        raise HTTPException(status_code=400, detail="account_id required")
-
-    try:
-        seat_limit = int(payload.get("seat_limit"))
-        knowledge_count = int(payload.get("knowledge_count"))
-    except Exception:
-        raise HTTPException(status_code=400, detail="seat_limit/knowledge_count must be int")
-
-    monthly_amount_yen = payload.get("monthly_amount_yen", None)
-    if monthly_amount_yen is None:
-        raise HTTPException(status_code=400, detail="monthly_amount_yen required")
-    try:
-        monthly_amount_yen = int(monthly_amount_yen)
-    except Exception:
-        raise HTTPException(status_code=400, detail="monthly_amount_yen must be int")
-
-    note = (payload.get("note") or "").strip()
-    plan_id = (payload.get("plan_id") or "").strip() or None
-
-    bucket = _bucket()
-    _assert_account_member(bucket, account_id, uid)
-
-    limits = _read_system_limits(bucket)
-    max_seat = int(limits.get("max_seat_limit") or 0)
-    max_kc = int(limits.get("max_knowledge_count") or 0)
-
-    if max_seat and seat_limit > max_seat:
-        raise HTTPException(status_code=400, detail="seat_limit exceeds system limit")
-    if max_kc and knowledge_count > max_kc:
-        raise HTTPException(status_code=400, detail="knowledge_count exceeds system limit")
-
-    path = f"accounts/{account_id}/tenants/{tenant_id}/tenant.json"
-    data = _read_json(bucket, path)
-
-    # 支払い後は変更不可
-    if bool(data.get("payment_method_configured")):
-        raise HTTPException(status_code=400, detail="contract is locked (payment configured)")
-
-    now = _now_iso()
-    data["seat_limit"] = seat_limit
-    data["knowledge_count"] = knowledge_count
-    data["monthly_amount_yen"] = monthly_amount_yen
-    data["note"] = note or None
-    data["plan_id"] = plan_id
-    data["updated_at"] = now
-
-    if not data.get("contract_saved_at"):
-        data["contract_saved_at"] = now
-
-    _write_json(bucket, path, data)
-
-    # 契約保存時にDBを作る（無い/0Bのみ）
-    _ensure_tenant_sqlite_dbs(bucket, account_id=account_id, tenant_id=tenant_id)
-
-    return {"ok": True}
