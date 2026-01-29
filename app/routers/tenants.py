@@ -86,6 +86,37 @@ def _assert_account_member(bucket, account_id: str, uid: str):
     """
     return True
 
+# =========================
+# Plans API (source of truth = GCS settings/plans.json)
+# =========================
+@router.get("/v1/plans")
+def get_plans(user=Depends(require_user)):
+    """
+    settings/plans.json をそのまま返す（加工しない）
+    """
+    bucket = _bucket()
+    gcs_path = "settings/plans.json"
+    blob = bucket.blob(gcs_path)
+    if not blob.exists():
+        raise HTTPException(status_code=404, detail=f"{gcs_path} not found in bucket={bucket.name}")
+
+    try:
+        data = json.loads(blob.download_as_text(encoding="utf-8"))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"plans.json read error: {e}")
+
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=500, detail="plans.json must be an object")
+
+    # 最低限のバリデーション（UIが詰むのを防ぐ）
+    plans = data.get("plans") or []
+    if not isinstance(plans, list) or len(plans) == 0:
+        raise HTTPException(
+            status_code=500,
+            detail=f"plans.json is empty (plans). Please update gs://{bucket.name}/{gcs_path}",
+        )
+
+    return data
 
 # =========================
 # Pricing API (source of truth = GCS settings/pricing.json)
