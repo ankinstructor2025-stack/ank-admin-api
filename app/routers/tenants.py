@@ -6,7 +6,7 @@ import os
 import sqlite3
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from google.cloud import storage
@@ -16,7 +16,6 @@ from app.deps.auth import require_user
 
 router = APIRouter()
 _storage = storage.Client()
-
 
 # =========================
 # Common helpers
@@ -37,9 +36,12 @@ def _read_json(bucket, path: str) -> dict:
         raise HTTPException(status_code=404, detail=f"not found: {path}")
     text = blob.download_as_text(encoding="utf-8")
     try:
-        return json.loads(text)
+        obj = json.loads(text)
     except json.JSONDecodeError:
         raise HTTPException(status_code=500, detail=f"invalid json: {path}")
+    if not isinstance(obj, dict):
+        raise HTTPException(status_code=500, detail=f"json must be an object: {path}")
+    return obj
 
 
 def _write_json(bucket, path: str, data: dict):
@@ -81,14 +83,49 @@ def _assert_account_member(bucket, account_id: str, uid: str):
     """
     account の member 判定を入れるならここ。
     いまは最小運用で未チェック（常にOK）。
-    将来:
-      accounts/<account_id>/members/<uid>.json を見て弾く等。
     """
     return True
 
+
 # =========================
-# Plans API (source of truth = GCS settings/plans.json)
+# Plans / Pricing (GCS)
 # =========================
+def _read_plans(bucket) -> dict:
+    # settings/plans.json（プラン定義）
+    return _read_json(bucket, "settings/plans.json")
+
+
+def _find_plan(plans_obj: dict, plan_id: str) -> Optional[dict]:
+    plans = plans_obj.get("plans") or []
+    if not isinstance(plans, list):
+        return None
+    for p in plans:
+        if isinstance(p, dict) and (p.get("plan_id") or "") == plan_id:
+            return p
+    return None
+
+
+def _plan_requires_db(plan: dict) -> bool:
+    """
+    plans.json の features.requires_db を見る。
+    - 無い場合は True 扱い（安全側）
+    """
+    f = plan.get("features") or {}
+    if not isinstance(f, dict):
+        return True
+    if "requires_db" not in f:
+        return True
+    return bool(f.get("requires_db"))
+
+
+def _plan_monthly_price(plan: dict) -> int:
+    v = plan.get("monthly_price", 0)
+    try:
+        return int(v)
+    except Exception:
+        raise HTTPException(status_code=500, detail="plans.json monthly_price must be int")
+
+
 @router.get("/v1/plans")
 def get_plans(user=Depends(require_user)):
     """
@@ -108,7 +145,6 @@ def get_plans(user=Depends(require_user)):
     if not isinstance(data, dict):
         raise HTTPException(status_code=500, detail="plans.json must be an object")
 
-    # 最低限のバリデーション（UIが詰むのを防ぐ）
     plans = data.get("plans") or []
     if not isinstance(plans, list) or len(plans) == 0:
         raise HTTPException(
@@ -118,17 +154,12 @@ def get_plans(user=Depends(require_user)):
 
     return data
 
-# =========================
-# Pricing API (source of truth = GCS settings/pricing.json)
-# =========================
+
+# 旧 pricing（seat/knowledge 前提）も残す
 @router.get("/v1/pricing")
 def get_pricing(user=Depends(require_user)):
     """
     settings/pricing.json をそのまま返す（加工しない）
-
-    重要:
-    - seats / knowledge_count が空のまま返ると UI が詰むので、
-      空なら 500 で止めて原因を明確にする。
     """
     bucket = _bucket()
     gcs_path = "settings/pricing.json"
@@ -214,7 +245,6 @@ def _ensure_tenant_sqlite_dbs(bucket, *, account_id: str, tenant_id: str):
         exists = blob.exists()
         size = blob.size if exists else None
 
-        # 既にちゃんとあるなら何もしない
         if exists and (size is not None) and size > 0:
             continue
 
@@ -381,11 +411,15 @@ def upsert_tenant_contract(
 ):
     """
     契約内容の保存
-    - 支払い前(payment_method_configured=false)は何度でも更新可
+    - 支払い前(payment_method_configured=false)は更新可
     - 支払い後(payment_method_configured=true)は更新不可（400）
-    - 保存時に SQLite(write/read) を生成（無い/0Bのみ。上書きしない）
+    - DB(write/read) は plan の requires_db=true のときだけ生成（無い/0Bのみ。上書きしない）
 
-    payload:
+    入力（新方式）:
+      account_id, tenant_id, plan_id, note?
+      monthly_amount_yen は plans.json の monthly_price を使う（payloadの値は信用しない）
+
+    入力（旧互換）:
       account_id, tenant_id, seat_limit, knowledge_count, monthly_amount_yen, note?, plan_id?
     """
     uid = (user.get("uid") or "").strip()
@@ -399,6 +433,81 @@ def upsert_tenant_contract(
     if not account_id:
         raise HTTPException(status_code=400, detail="account_id required")
 
+    note = (payload.get("note") or "").strip()
+    plan_id = (payload.get("plan_id") or "").strip() or None
+
+    bucket = _bucket()
+    _assert_account_member(bucket, account_id, uid)
+
+    path = f"accounts/{account_id}/tenants/{tenant_id}/tenant.json"
+    data = _read_json(bucket, path)
+
+    # 支払い後は変更不可
+    if bool(data.get("payment_method_configured")):
+        raise HTTPException(status_code=400, detail="contract is locked (payment configured)")
+
+    limits = _read_system_limits(bucket)
+    max_seat = int(limits.get("max_seat_limit") or 0)
+    max_kc = int(limits.get("max_knowledge_count") or 0)
+
+    # -------------------------
+    # 新方式：plan_id 優先
+    # -------------------------
+    seat_limit: Optional[int] = None
+    knowledge_count: Optional[int] = None
+
+    if plan_id:
+        plans_obj = _read_plans(bucket)
+        plan = _find_plan(plans_obj, plan_id)
+        if not plan:
+            raise HTTPException(status_code=400, detail=f"unknown plan_id: {plan_id}")
+
+        monthly_amount_yen = _plan_monthly_price(plan)
+
+        # seat_limit / knowledge_count は任意（旧互換で送られてきたら保存する）
+        if payload.get("seat_limit") is not None:
+            try:
+                seat_limit = int(payload.get("seat_limit"))
+            except Exception:
+                raise HTTPException(status_code=400, detail="seat_limit must be int")
+        if payload.get("knowledge_count") is not None:
+            try:
+                knowledge_count = int(payload.get("knowledge_count"))
+            except Exception:
+                raise HTTPException(status_code=400, detail="knowledge_count must be int")
+
+        # システム上限チェック（値がある場合のみ）
+        if seat_limit is not None and max_seat and seat_limit > max_seat:
+            raise HTTPException(status_code=400, detail="seat_limit exceeds system limit")
+        if knowledge_count is not None and max_kc and knowledge_count > max_kc:
+            raise HTTPException(status_code=400, detail="knowledge_count exceeds system limit")
+
+        now = _now_iso()
+        data["plan_id"] = plan_id
+        data["monthly_amount_yen"] = monthly_amount_yen
+        data["note"] = note or None
+        data["updated_at"] = now
+
+        # 任意項目（入ってきた場合のみ更新）
+        if seat_limit is not None:
+            data["seat_limit"] = seat_limit
+        if knowledge_count is not None:
+            data["knowledge_count"] = knowledge_count
+
+        if not data.get("contract_saved_at"):
+            data["contract_saved_at"] = now
+
+        _write_json(bucket, path, data)
+
+        # requires_db=true のときだけDB作成
+        if _plan_requires_db(plan):
+            _ensure_tenant_sqlite_dbs(bucket, account_id=account_id, tenant_id=tenant_id)
+
+        return {"ok": True}
+
+    # -------------------------
+    # 旧互換：plan_id が無い場合は従来どおり必須
+    # -------------------------
     try:
         seat_limit = int(payload.get("seat_limit"))
         knowledge_count = int(payload.get("knowledge_count"))
@@ -413,34 +522,17 @@ def upsert_tenant_contract(
     except Exception:
         raise HTTPException(status_code=400, detail="monthly_amount_yen must be int")
 
-    note = (payload.get("note") or "").strip()
-    plan_id = (payload.get("plan_id") or "").strip() or None
-
-    bucket = _bucket()
-    _assert_account_member(bucket, account_id, uid)
-
-    limits = _read_system_limits(bucket)
-    max_seat = int(limits.get("max_seat_limit") or 0)
-    max_kc = int(limits.get("max_knowledge_count") or 0)
-
     if max_seat and seat_limit > max_seat:
         raise HTTPException(status_code=400, detail="seat_limit exceeds system limit")
     if max_kc and knowledge_count > max_kc:
         raise HTTPException(status_code=400, detail="knowledge_count exceeds system limit")
-
-    path = f"accounts/{account_id}/tenants/{tenant_id}/tenant.json"
-    data = _read_json(bucket, path)
-
-    # 支払い後は変更不可
-    if bool(data.get("payment_method_configured")):
-        raise HTTPException(status_code=400, detail="contract is locked (payment configured)")
 
     now = _now_iso()
     data["seat_limit"] = seat_limit
     data["knowledge_count"] = knowledge_count
     data["monthly_amount_yen"] = monthly_amount_yen
     data["note"] = note or None
-    data["plan_id"] = plan_id
+    data["plan_id"] = None
     data["updated_at"] = now
 
     if not data.get("contract_saved_at"):
@@ -448,7 +540,7 @@ def upsert_tenant_contract(
 
     _write_json(bucket, path, data)
 
-    # 契約保存時にDBを作る（無い/0Bのみ）
+    # 旧方式は従来どおりDB作成
     _ensure_tenant_sqlite_dbs(bucket, account_id=account_id, tenant_id=tenant_id)
 
     return {"ok": True}
