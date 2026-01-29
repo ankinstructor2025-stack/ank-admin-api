@@ -582,3 +582,65 @@ def mark_paid(
 
     _write_json(bucket, path, data)
     return {"ok": True}
+
+@router.get("/v1/my/tenant")
+def get_my_single_tenant(
+    account_id: str = Query(...),
+    user=Depends(require_user),
+):
+    """
+    単一テナント運用向け：
+    users/<uid>/tenants/*.json（逆引き）から、指定account_idのtenantを1件返す。
+    複数あっても「最初の1件だけ」返す（複数対応は後回し）。
+
+    return:
+      { exists: bool, account_id, tenant_id?, plan_id? }
+    """
+    uid = (user.get("uid") or "").strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="no uid")
+
+    account_id = (account_id or "").strip()
+    if not account_id:
+        raise HTTPException(status_code=400, detail="account_id required")
+
+    bucket = _bucket()
+
+    # 逆引き（ユーザー→テナント）から探す
+    prefix = f"users/{uid}/tenants/"
+    found_tenant_id = None
+
+    for b in _storage.list_blobs(bucket, prefix=prefix):
+        # users/<uid>/tenants/<tenant_id>.json だけを見る
+        if not b.name.endswith(".json"):
+            continue
+
+        try:
+            idx = json.loads(b.download_as_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        if not isinstance(idx, dict):
+            continue
+
+        aid = (idx.get("account_id") or "").strip()
+        tid = (idx.get("tenant_id") or "").strip()
+
+        if aid == account_id and tid:
+            found_tenant_id = tid
+            break
+
+    if not found_tenant_id:
+        return {"exists": False, "account_id": account_id}
+
+    # tenant本体から plan_id を取る（accounts配下はsource of truth）
+    tenant_path = f"accounts/{account_id}/tenants/{found_tenant_id}/tenant.json"
+    t = _read_json(bucket, tenant_path)
+    plan_id = (t.get("plan_id") or "").strip() or None
+
+    return {
+        "exists": True,
+        "account_id": account_id,
+        "tenant_id": found_tenant_id,
+        "plan_id": plan_id,
+    }
