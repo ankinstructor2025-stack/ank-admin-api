@@ -19,7 +19,6 @@ import urllib.request
 import urllib.error
 
 from app.deps.auth import require_user
-from app.deps.db import get_db
 
 router = APIRouter()
 
@@ -96,7 +95,6 @@ def _require_contract_member(uid: str, contract_id: str, conn) -> None:
 def qa_generate_file(
     payload: dict,
     user=Depends(require_user),
-    conn=Depends(get_db),
 ):
     """
     UIから {contract_id, object_key, format} を受け取り、knowledge の /v1/qa/generate-file に中継する。
