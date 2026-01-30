@@ -37,28 +37,55 @@ def _blob_exists(bucket, path: str) -> bool:
     return bucket.blob(path).exists()
 
 
-def _list_account_index(bucket, auth_key: str) -> list[dict[str, Any]]:
+def _account_id_for_uid(uid: str) -> str:
+    # 1ユーザー=1アカウント（複数アカウントは持たない）
+    return f"acc_{uid}"
+
+
+def _list_tenants(bucket, account_id: str) -> list[dict[str, Any]]:
     """
-    users/<auth_key>/accounts/<account_id>.json を列挙して
-    [{account_id, role, status}, ...] を返す（全走査しない）
+    accounts/<account_id>/tenants/<tenant_id>/tenant.json を列挙して tenants を返す。
+    契約はテナント1:1なので、
+      accounts/<account_id>/tenants/<tenant_id>/contract.json の有無で has_contract を判定。
     """
-    prefix = f"users/{auth_key}/accounts/"
-    out: list[dict[str, Any]] = []
+    prefix = f"accounts/{account_id}/tenants/"
+    tenants: list[dict[str, Any]] = []
+
+    # tenant.json を手掛かりに tenant_id を拾う
     for b in _storage.list_blobs(bucket, prefix=prefix):
-        if not b.name.endswith(".json"):
+        if not b.name.endswith("/tenant.json"):
             continue
+
+        # accounts/<aid>/tenants/<tid>/tenant.json
+        parts = b.name.split("/")
+        # ["accounts", aid, "tenants", tid, "tenant.json"]
+        if len(parts) < 5:
+            continue
+        tenant_id = parts[3]
+
+        # tenant.json を読む（壊れてたら最低限で返す）
+        name = ""
+        status = ""
         try:
             data = json.loads(b.download_as_text(encoding="utf-8"))
+            name = (data.get("name") or "").strip()
+            status = (data.get("status") or "").strip()
         except Exception:
-            continue
-        out.append(
+            pass
+
+        contract_path = f"accounts/{account_id}/tenants/{tenant_id}/contract.json"
+        has_contract = _blob_exists(bucket, contract_path)
+
+        tenants.append(
             {
-                "account_id": data.get("account_id") or "",
-                "role": data.get("role") or "",
-                "status": data.get("status") or "",
+                "tenant_id": tenant_id,
+                "name": name,
+                "status": status,
+                "has_contract": has_contract,
             }
         )
-    return out
+
+    return tenants
 
 
 # =========================
@@ -68,8 +95,10 @@ def _list_account_index(bucket, auth_key: str) -> list[dict[str, Any]]:
 def get_session(user=Depends(require_user)):
     """
     入口判定（DBなし）
-    - users/<uid>/user.json があるか
-    - users/<uid>/accounts/*.json を返す
+    - ログイン＝認証済み（uid/emailが取れている）
+    - アプリ内ユーザーは users/<uid>/user.json があるときだけ存在
+    - アカウントは 1ユーザー=1アカウント（acc_<uid>）で固定
+    - テナント一覧と、契約（テナント1:1）の有無を返す
     """
     email = (user.get("email") or "").strip()
     uid = (user.get("uid") or "").strip()
@@ -80,17 +109,27 @@ def get_session(user=Depends(require_user)):
         raise HTTPException(status_code=400, detail="no email in session")
 
     bucket = _bucket()
-    auth_key = uid  # 将来 MS 対応するならここを provider付きにする
 
-    user_exists = _blob_exists(bucket, f"users/{auth_key}/user.json")
-    accounts = _list_account_index(bucket, auth_key)
+    account_id = _account_id_for_uid(uid)
+
+    # アプリ内ユーザー（＝アカウント作成後に作る想定）
+    user_exists = _blob_exists(bucket, f"users/{uid}/user.json")
+
+    # アカウント実体（accounts/<account_id>/account.json）
+    account_exists = _blob_exists(bucket, f"accounts/{account_id}/account.json")
+
+    tenants: list[dict[str, Any]] = []
+    if account_exists:
+        tenants = _list_tenants(bucket, account_id)
 
     return {
         "authed": True,
         "uid": uid,
         "email": email,
         "user_exists": user_exists,
-        "accounts": accounts,
+        "account_id": account_id,           # ★ これがないと tenants 画面に渡せない
+        "account_exists": account_exists,   # ★ 入口分岐に使える
+        "tenants": tenants,                 # ★ tenantが無ければ tenants作成へ
     }
 
 
