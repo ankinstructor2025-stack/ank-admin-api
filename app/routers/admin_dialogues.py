@@ -167,3 +167,71 @@ def build_qa_file(
         # UIが「結果をダウンロード」で使うべきキー
         "qa_file_object_key": qa_file_key,
     }
+
+# --- added endpoints (non-DB / thin proxy) -----------------------------------
+
+def _get_knowledge_base_url() -> str:
+    """
+    admin -> knowledge の中継先。
+    Cloud Run の環境変数 KNOWLEDGE_API_BASE_URL に設定する。
+    例: https://ank-knowledge-api-xxxx.asia-northeast1.run.app
+    """
+    base = (os.getenv("KNOWLEDGE_API_BASE_URL") or "").strip()
+    if not base:
+        raise HTTPException(status_code=500, detail="KNOWLEDGE_API_BASE_URL not set")
+    return base.rstrip("/")
+
+
+@router.post("/v1/qa/generate-file")
+def qa_generate_file(
+    body: dict,
+    user=Depends(require_user),
+):
+    """
+    UI → admin → knowledge の中継（generate-file）
+
+    入力例：
+      {
+        "contract_id": "con_xxx",
+        "object_key": "tenants/.../uploads/..",
+        "format": "json"
+      }
+
+    備考：
+    - この admin 側は Cloud SQL を使わない前提のため、ここでは DB による権限確認をしない。
+    - 入口制御（ログイン必須）は require_user で行う。
+    - contract_id は、そのまま knowledge 側へ渡す（knowledge 側で必要に応じて検証する）。
+    """
+    contract_id = (body.get("contract_id") or body.get("tenant_id") or "").strip()
+    object_key = (body.get("object_key") or "").strip()
+    fmt = (body.get("format") or body.get("output_format") or "json").strip().lower()
+
+    if not contract_id:
+        raise HTTPException(status_code=400, detail="contract_id required")
+    if not object_key:
+        raise HTTPException(status_code=400, detail="object_key required")
+    if fmt not in ("csv", "json", "jsonl"):
+        raise HTTPException(status_code=400, detail="format must be csv/json/jsonl")
+
+    knowledge_base = _get_knowledge_base_url()
+    url = knowledge_base + "/v1/qa/generate-file"
+
+    payload = {
+        "contract_id": contract_id,
+        "object_key": object_key,
+        "format": fmt,
+    }
+
+    knowledge_body = _http_post_json(url, payload, timeout_sec=180)
+
+    # UIが知りたいキーを拾っておく（返りが揺れても耐える）
+    qa_file_key = _extract_qa_file_key(knowledge_body)
+
+    return {
+        "ok": True,
+        "contract_id": contract_id,
+        "object_key": object_key,
+        "format": fmt,
+        "knowledge": knowledge_body,
+        "qa_file_object_key": qa_file_key,
+    }
