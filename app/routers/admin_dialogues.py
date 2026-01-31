@@ -18,7 +18,7 @@ import urllib.error
 
 # 既存の auth/guard に合わせる（ここはプロジェクト側の実装に依存）
 from app.deps.auth import require_user
-
+from app.core.settings import BUCKET_NAME
 
 router = APIRouter()
 
@@ -247,9 +247,9 @@ def get_qa_prompt(
     import json
     from google.cloud import storage
 
-    bucket_name = os.getenv("GCS_BUCKET_NAME") or os.getenv("ANK_BUCKET_NAME")
+    bucket_name = (BUCKET_NAME or "").strip()
     if not bucket_name:
-        raise HTTPException(status_code=500, detail="GCS_BUCKET_NAME not set")
+        raise HTTPException(status_code=500, detail="BUCKET_NAME not set")
 
     mode = mode.strip()
     if not mode:
