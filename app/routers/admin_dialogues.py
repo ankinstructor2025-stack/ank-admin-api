@@ -17,7 +17,7 @@ import urllib.request
 import urllib.error
 
 # 既存の auth/guard に合わせる（ここはプロジェクト側の実装に依存）
-from app.core.auth import require_user
+from app.deps.auth import require_user
 
 
 router = APIRouter()
