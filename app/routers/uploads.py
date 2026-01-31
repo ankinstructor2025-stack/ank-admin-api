@@ -1,13 +1,13 @@
 # app/routers/uploads.py
-# 方針：
-# 1) upload-url：署名URLを返すだけ（DBは書かない）
+# 方針（DBアクセス停止版）：
+# 1) upload-url：署名URLを返すだけ（DB参照/書き込みなし）
 # 2) upload-finalize：GCSの内容をサンプル読取→QA化可否/方式判定
 #    - NG：GCS削除 + エラーメッセージ
-#    - OK：upload_logs に INSERT（OKの時だけ）
+#    - OK：upload_logs 相当を GCS に JSON 保存（DBへINSERTしない）
 #
-# 重要：
-# - upload_logs のスキーマが古い場合でも 500 で落ちないようにフォールバックする
-# - 方式は A-F（A:話者ラベル対話 / B:JSON / C:CSV / D:単一文書 / E:QA形式 / F:ログ/チケット/メール）
+# 補足：
+# - contract_id は当面互換のため受け取るが、内部は tenant_id として扱えるようにする
+# - テナント別管理：object_key は tenants/{tenant_id}/uploads/... に寄せる
 
 import os
 import re
@@ -15,18 +15,15 @@ import uuid
 import json
 import csv
 from io import StringIO
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from google.cloud import storage
 from google.oauth2 import service_account
 
-from app.deps.auth import require_user
-from app.deps.db import get_db
-from app.services.contracts_acl import require_contract_admin
 from app.core import settings as app_settings  # BUCKET_NAME/UPLOAD_BUCKET 等
 
 router = APIRouter()
@@ -37,7 +34,18 @@ router = APIRouter()
 ALLOWED_EXTS = {".txt", ".json", ".csv"}
 MAX_BYTES = 100 * 1024 * 1024  # 100MB
 MIN_BYTES = 1
-MAX_DIALOGUE_PER_MONTH = 2000  # dialogueのみ：OKになったものだけカウント
+
+# 署名URL期限
+SIGNED_URL_EXPIRES_MIN = 15
+
+# GCS上の保存先
+# tenants/{tenant_id}/uploads/{YYYY-MM}/{upload_id}_{safe_filename}
+# tenants/{tenant_id}/upload_logs/{YYYY-MM}/{upload_id}.json
+def _object_key_upload(tenant_id: str, month_key: str, upload_id: str, safe_filename: str) -> str:
+    return f"tenants/{tenant_id}/uploads/{month_key}/{upload_id}_{safe_filename}"
+
+def _object_key_upload_log(tenant_id: str, month_key: str, upload_id: str) -> str:
+    return f"tenants/{tenant_id}/upload_logs/{month_key}/{upload_id}.json"
 
 # -------------------------
 # Util
@@ -51,18 +59,18 @@ def _get_bucket_name() -> str:
         return name
     raise HTTPException(status_code=500, detail="BUCKET_NAME (or UPLOAD_BUCKET) is not set")
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 def _month_key_jst() -> str:
-    # 月単位キー（JST厳密が必要なら後で差し替え）
+    # 厳密JSTが必要なら後で差し替え。ひとまず UTC を月キーにする。
     now = datetime.utcnow()
     return f"{now.year:04d}-{now.month:02d}"
-
 
 def _ext_lower(filename: str) -> str:
     name = (filename or "").strip().lower()
     i = name.rfind(".")
     return name[i:] if i >= 0 else ""
-
 
 def _validate_file_meta(filename: str, size_bytes: int):
     ext = _ext_lower(filename)
@@ -73,13 +81,11 @@ def _validate_file_meta(filename: str, size_bytes: int):
     if size_bytes < MIN_BYTES:
         raise HTTPException(status_code=400, detail="ファイルサイズが小さすぎます")
 
-
 def _safe_name(filename: str) -> str:
     s = (filename or "file").strip()
     s = s.replace("/", "_").replace("\\", "_").replace("..", "_")
     s = re.sub(r"[^\w\.\-\(\)\[\]ぁ-んァ-ン一-龥]+", "_", s)
     return s[:120] if len(s) > 120 else s
-
 
 def _resolve_signer_file(path: str) -> Optional[str]:
     """
@@ -117,7 +123,6 @@ def _resolve_signer_file(path: str) -> Optional[str]:
             return cand[0]
     return None
 
-
 def _signer_credentials_from_env_or_secret() -> service_account.Credentials:
     """
     署名URL(v4 PUT)生成のためのサービスアカウント鍵を読む。
@@ -141,15 +146,12 @@ def _signer_credentials_from_env_or_secret() -> service_account.Credentials:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"failed to load signer credentials: {signer_file}: {e}")
 
-
 def _gcs_client_with_signer() -> storage.Client:
     cred = _signer_credentials_from_env_or_secret()
     return storage.Client(credentials=cred)
 
-
 def _gcs_read_head_text(object_key: str, max_bytes: int = 200_000) -> str:
     bucket_name = _get_bucket_name()
-    # 読み取りは実行SAでOK（必要な権限が付いている前提）
     client = storage.Client()
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(object_key)
@@ -160,7 +162,6 @@ def _gcs_read_head_text(object_key: str, max_bytes: int = 200_000) -> str:
         return data.decode("utf-8", errors="replace")
     except Exception:
         return data.decode(errors="replace")
-
 
 def _gcs_delete(object_key: str):
     bucket_name = _get_bucket_name()
@@ -173,26 +174,15 @@ def _gcs_delete(object_key: str):
         # 削除失敗は握る（ユーザにはNGメッセージを返したい）
         pass
 
-
-def _db_has_columns(conn, table: str, cols: List[str]) -> Dict[str, bool]:
-    """
-    upload_logs の列が存在するか確認（存在しない列を INSERT して 500 になるのを避ける）
-    """
-    colset = set()
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_schema = 'public'
-              AND table_name = %s
-            """,
-            (table,),
-        )
-        for row in cur.fetchall():
-            colset.add(row[0])
-    return {c: (c in colset) for c in cols}
-
+def _gcs_write_json(object_key: str, data: dict):
+    bucket_name = _get_bucket_name()
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(object_key)
+    blob.upload_from_string(
+        json.dumps(data, ensure_ascii=False),
+        content_type="application/json; charset=utf-8",
+    )
 
 # -------------------------
 # 判定ロジック（A-F）
@@ -204,17 +194,14 @@ class JudgeResult(BaseModel):
     reasons: List[str] = []
     stats: Dict[str, Any] = {}
 
-
 def _looks_like_json(text: str) -> bool:
     s = text.lstrip()
     return s.startswith("{") or s.startswith("[")
-
 
 def _try_parse_json(text: str) -> Optional[dict]:
     try:
         obj = json.loads(text)
         if isinstance(obj, dict):
-            # {"messages":[...]} 形式など
             if isinstance(obj.get("messages"), list):
                 return {"kind": "messages"}
         if isinstance(obj, list):
@@ -224,7 +211,6 @@ def _try_parse_json(text: str) -> Optional[dict]:
     except Exception:
         return None
 
-
 def _try_parse_csv(text: str) -> Optional[dict]:
     try:
         reader = csv.reader(StringIO(text))
@@ -232,27 +218,20 @@ def _try_parse_csv(text: str) -> Optional[dict]:
         if not rows:
             return None
         header = rows[0]
-        # それっぽい列名が無くてもCSVとしては成立しているのでOK扱い
         header_l = [str(h or "").strip().lower() for h in header]
         return {"rows": len(rows), "cols": len(header), "header": header_l}
     except Exception:
         return None
 
-
 def _looks_like_speaker_dialogue(lines: List[str]) -> int:
-    # 例: "山田: こんにちは" / "A：..." / "User: ..."
     rg = re.compile(r"^[^:：]{1,20}[:：]\s*\S+")
     return sum(1 for ln in lines[:200] if rg.search(ln))
 
-
 def _looks_like_qa_style(lines: List[str]) -> int:
-    # 例: "Q: ..." "A: ..." / "質問:" "回答:"
     rg = re.compile(r"^(Q[:：]|A[:：]|質問[:：]|回答[:：])\s*\S+", re.IGNORECASE)
     return sum(1 for ln in lines[:200] if rg.search(ln))
 
-
 def _looks_like_ticket_mail(text: str, lines: List[str]) -> bool:
-    # メール/チケット/スレ: ヘッダ、引用、区切り、タイムスタンプ等
     head = "\n".join(lines[:80]).lower()
     if "subject:" in head or "from:" in head or "to:" in head or "cc:" in head or "date:" in head:
         return True
@@ -263,7 +242,6 @@ def _looks_like_ticket_mail(text: str, lines: List[str]) -> bool:
     if re.search(r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b", "\n".join(lines[:200])):
         return True
     return False
-
 
 def _detect_mode_A_to_F(filename: str, content_type: str, text: str) -> Tuple[bool, Optional[str], float, List[str], Dict[str, Any]]:
     ext = _ext_lower(filename)
@@ -278,106 +256,86 @@ def _detect_mode_A_to_F(filename: str, content_type: str, text: str) -> Tuple[bo
     if len(text.strip()) < 50:
         return False, None, 0.0, ["内容が短すぎます"], stats
 
-    # B: JSON（messages配列 / role付き）
+    # B: JSON
     if ext == ".json" or _looks_like_json(text):
         j = _try_parse_json(text)
         if j:
             stats["json_kind"] = j.get("kind")
             return True, "B", 0.90, ["JSON（messages/role）として判定"], stats
 
-    # C: CSV（列あり：speaker,text / role,content）
+    # C: CSV
     if ext == ".csv":
         c = _try_parse_csv(text)
         if c:
             stats.update({"csv_rows": c.get("rows"), "csv_cols": c.get("cols"), "csv_header": c.get("header")})
             return True, "C", 0.80, ["CSVとして判定"], stats
 
-    # E: 既にQAっぽい（Q: A: / 質問: 回答:）
+    # E: QA形式
     qa_hits = _looks_like_qa_style(lines)
     if qa_hits >= 2:
         stats["qa_hits"] = qa_hits
         return True, "E", 0.80, ["QA形式として判定"], stats
 
-    # F: ログチケット/メールスレ（引用・ヘッダ・区切り）
+    # F: ログ/チケット/メール
     if _looks_like_ticket_mail(text, lines):
         return True, "F", 0.75, ["ログ/チケット/メールスレとして判定"], stats
 
-    # A: プレーンテキスト対話（話者ラベルあり）
+    # A: 話者ラベル対話
     sp_hits = _looks_like_speaker_dialogue(lines)
     if sp_hits >= 2:
         stats["speaker_hits"] = sp_hits
         return True, "A", 0.75, ["話者ラベル付き対話として判定"], stats
 
-    # D: 単一文書（ぎじろく・レポート・FAQ未満）
+    # D: 単一文書
     if len(lines) >= 5:
         return True, "D", 0.60, ["単一文書として判定"], stats
 
     return False, None, 0.0, ["形式が判定できません（特徴が弱い）"], stats
 
-
 def judge_qa_mode(filename: str, content_type: str, text: str) -> JudgeResult:
     ok, mode, conf, reasons, stats = _detect_mode_A_to_F(filename, content_type, text)
     return JudgeResult(ok=ok, qa_mode=mode, confidence=conf, reasons=reasons, stats=stats)
-
 
 # -------------------------
 # API
 # -------------------------
 class UploadUrlRequest(BaseModel):
-    contract_id: str = Field(..., min_length=1)
+    # 互換のため contract_id を残す（内部では tenant_id として扱える）
+    tenant_id: Optional[str] = Field(default=None)
+    contract_id: Optional[str] = Field(default=None)
+
     kind: str = Field(default="dialogue")
     filename: str = Field(..., min_length=1)
     content_type: str = Field(default="application/octet-stream")
     size_bytes: int = Field(default=0, ge=0)
     note: str = Field(default="")
 
+def _resolve_tenant_id(req: UploadUrlRequest) -> str:
+    t = (req.tenant_id or "").strip()
+    if t:
+        return t
+    # 互換：contract_id を tenant_id 扱い
+    c = (req.contract_id or "").strip()
+    if c:
+        return c
+    raise HTTPException(status_code=400, detail="tenant_id (or contract_id) is required")
 
 @router.post("/v1/admin/upload-url")
-def create_upload_url(
-    req: UploadUrlRequest,
-    user=Depends(require_user),
-    conn=Depends(get_db),
-):
-    # 1) 認証
-    uid = (user.get("uid") or "").strip()
-    if not uid:
-        raise HTTPException(status_code=400, detail="no uid in token")
-
-    # 2) 入力
-    contract_id = (req.contract_id or "").strip()
-    if not contract_id:
-        raise HTTPException(status_code=400, detail="contract_id is required")
-
-    require_contract_admin(uid, contract_id, conn)
+def create_upload_url(req: UploadUrlRequest):
+    """
+    DBアクセス停止版：
+      - 認可は一旦ここでは行わない（将来: user.json で tenant role を確認）
+      - ファイルメタ検証 → object_key 作成 → 署名URL返却
+    """
+    tenant_id = _resolve_tenant_id(req)
     _validate_file_meta(req.filename, int(req.size_bytes or 0))
 
-    # 3) 月キー＆上限（OKのときだけカウント = upload_logs参照）
     mk = _month_key_jst()
-    if (req.kind or "dialogue") == "dialogue":
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT COUNT(*)
-                FROM upload_logs
-                WHERE contract_id = %s
-                  AND kind = 'dialogue'
-                  AND month_key = %s
-                """,
-                (contract_id, mk),
-            )
-            cnt = int(cur.fetchone()[0] or 0)
-        if cnt >= MAX_DIALOGUE_PER_MONTH:
-            raise HTTPException(
-                status_code=409,
-                detail=f"dialogue uploads limit reached: {cnt}/{MAX_DIALOGUE_PER_MONTH} for {mk}",
-            )
-
-    # 4) object_key
     upload_id = str(uuid.uuid4())
     safe = _safe_name(req.filename)
-    object_key = f"contracts/{contract_id}/{mk}/{upload_id}_{safe}"
 
-    # 5) Signed URL
+    object_key = _object_key_upload(tenant_id, mk, upload_id, safe)
+
     bucket_name = _get_bucket_name()
     client = _gcs_client_with_signer()
     bucket = client.bucket(bucket_name)
@@ -385,49 +343,48 @@ def create_upload_url(
 
     url = blob.generate_signed_url(
         version="v4",
-        expiration=timedelta(minutes=15),
+        expiration=timedelta(minutes=SIGNED_URL_EXPIRES_MIN),
         method="PUT",
         content_type=req.content_type or "application/octet-stream",
     )
 
-    # DBは書かない（OK時だけ）
     return {
         "upload_id": upload_id,
         "object_key": object_key,
         "upload_url": url,
         "month_key": mk,
+        "tenant_id": tenant_id,
+        "kind": (req.kind or "dialogue").strip() or "dialogue",
     }
 
-
 @router.post("/v1/admin/upload-finalize")
-def upload_finalize(
-    payload: dict,
-    user=Depends(require_user),
-    conn=Depends(get_db),
-):
-    # 1) 認証
-    uid = (user.get("uid") or "").strip()
-    if not uid:
-        raise HTTPException(status_code=400, detail="no uid in token")
+def upload_finalize(payload: dict):
+    """
+    DBアクセス停止版：
+      - object_key を先頭サンプル読み込みして方式判定
+      - NG：GCS削除
+      - OK：upload_logs 相当を GCS JSON として保存
+    """
+    # 入力
+    tenant_id = (payload.get("tenant_id") or "").strip()
+    contract_id = (payload.get("contract_id") or "").strip()  # 互換
+    if not tenant_id:
+        tenant_id = contract_id
 
-    contract_id = (payload.get("contract_id") or "").strip()
     object_key = (payload.get("object_key") or "").strip()
     upload_id = (payload.get("upload_id") or "").strip()
-    filename = (payload.get("filename") or "").strip()  # 任意（UIが送るなら使う）
-    content_type = (payload.get("content_type") or "").strip()  # 任意
-    kind = (payload.get("kind") or "dialogue").strip() or "dialogue"  # 任意（UIが送るなら使う）
+    filename = (payload.get("filename") or "").strip()
+    content_type = (payload.get("content_type") or "").strip()
+    kind = (payload.get("kind") or "dialogue").strip() or "dialogue"
 
-    if not contract_id or not object_key or not upload_id:
-        raise HTTPException(status_code=400, detail="contract_id, object_key, upload_id are required")
+    if not tenant_id or not object_key or not upload_id:
+        raise HTTPException(status_code=400, detail="tenant_id (or contract_id), object_key, upload_id are required")
 
-    require_contract_admin(uid, contract_id, conn)
-
-    # 2) GCSから先頭を読む（判定用）
+    # 判定用に先頭を読む
     text = _gcs_read_head_text(object_key)
     judge = judge_qa_mode(filename or object_key, content_type, text)
 
     if not judge.ok:
-        # NG：削除して返す
         _gcs_delete(object_key)
         return {
             "ok": False,
@@ -436,97 +393,45 @@ def upload_finalize(
             "stats": judge.stats,
         }
 
-    # 3) OK：upload_logsへINSERT（OKのときだけ）
+    # OK：upload_logs を GCS に JSON で保存
     mk = _month_key_jst()
+    log_key = _object_key_upload_log(tenant_id, mk, upload_id)
 
-    # DBスキーマ差を吸収（存在する列だけ書く）
-    col = _db_has_columns(
-        conn,
-        "upload_logs",
-        [
-            "qa_mode",
-            "confidence",
-            "judge_can_extract_qa",
-            "judge_method",
-            "judge_confidence",
-            "judge_reasons",
-            "judge_stats",
-        ],
-    )
-
-    # 必須列（古いスキーマでも存在する想定）
-    cols = ["upload_id", "contract_id", "kind", "object_key", "month_key", "created_at"]
-    vals: List[Any] = [upload_id, contract_id, kind, object_key, mk]
-    created_expr = "NOW()"
-
-    # 任意列（存在するものだけ追加）
-    if col.get("qa_mode"):
-        cols.append("qa_mode")
-        vals.append(judge.qa_mode)  # "A".."F"
-
-    if col.get("confidence"):
-        cols.append("confidence")
-        vals.append(float(judge.confidence or 0.0))
-
-    if col.get("judge_can_extract_qa"):
-        cols.append("judge_can_extract_qa")
-        vals.append(True)
-
-    if col.get("judge_method"):
-        # 方式そのものを入れる（A-F）
-        cols.append("judge_method")
-        vals.append(judge.qa_mode)
-
-    if col.get("judge_confidence"):
-        cols.append("judge_confidence")
-        vals.append(float(judge.confidence or 0.0))
-
-    if col.get("judge_reasons"):
-        cols.append("judge_reasons")
-        vals.append(json.dumps(judge.reasons or [], ensure_ascii=False))
-
-    if col.get("judge_stats"):
-        cols.append("judge_stats")
-        vals.append(json.dumps(judge.stats or {}, ensure_ascii=False))
-
-    # INSERT文生成（created_at は NOW() 固定）
-    # cols: ... created_at が最後に含まれるので、そこだけ式を使う
-    col_names_sql = ", ".join(cols)
-    placeholders_sql_parts = []
-    # upload_id..month_key までは %s
-    # created_at は NOW()
-    # 追加分は %s
-    # vals は created_at を含めない（NOW() を使う）
-    base_count = 5  # upload_id, contract_id, kind, object_key, month_key
-    # cols は [.., created_at, ..optional..] だが、created_at は最後の必須として固定している
-    # → placeholdersは base_count分の%s + NOW() + optional分の%s
-    optional_count = len(vals) - base_count
-    placeholders_sql_parts.extend(["%s"] * base_count)
-    placeholders_sql_parts.append(created_expr)
-    placeholders_sql_parts.extend(["%s"] * (optional_count))
-    placeholders_sql = ", ".join(placeholders_sql_parts)
-
-    sql = f"""
-        INSERT INTO upload_logs ({col_names_sql})
-        VALUES ({placeholders_sql})
-    """
+    log_doc = {
+        "upload_id": upload_id,
+        "tenant_id": tenant_id,
+        "kind": kind,
+        "object_key": object_key,
+        "month_key": mk,
+        "created_at": _now_iso(),
+        "filename": filename or "",
+        "content_type": content_type or "",
+        "judge": {
+            "ok": True,
+            "qa_mode": judge.qa_mode,            # "A".."F"
+            "confidence": float(judge.confidence or 0.0),
+            "reasons": judge.reasons or [],
+            "stats": judge.stats or {},
+        },
+        "note": (payload.get("note") or "").strip(),
+    }
 
     try:
-        with conn.cursor() as cur:
-            cur.execute(sql, tuple(vals))
-        conn.commit()
+        _gcs_write_json(log_key, log_doc)
     except Exception as e:
-        # DB失敗時：GCSは消さない（原因調査用に残す）
-        raise HTTPException(status_code=500, detail=f"failed to insert upload_logs: {e}")
+        # ログ保存に失敗しても、アップロードデータは残す（原因調査用）
+        raise HTTPException(status_code=500, detail=f"failed to write upload log to GCS: {e}")
 
-    # レスポンス形は従来どおり（UI側を壊さない）
+    # UI互換のレスポンス（従来と同じキーをなるべく維持）
     return {
         "ok": True,
         "upload_id": upload_id,
-        "contract_id": contract_id,
+        "tenant_id": tenant_id,
+        "contract_id": tenant_id,  # 互換：フロントが contract_id を見ていても破綻しにくい
         "object_key": object_key,
-        "qa_mode": judge.qa_mode,          # ここが A-F になる
+        "qa_mode": judge.qa_mode,
         "confidence": judge.confidence,
         "reasons": judge.reasons,
         "stats": judge.stats,
+        "upload_log_key": log_key,
     }
