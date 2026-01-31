@@ -235,3 +235,43 @@ def qa_generate_file(
         "knowledge": knowledge_body,
         "qa_file_object_key": qa_file_key,
     }
+
+@router.get("/v1/admin/qa-prompt")
+def get_qa_prompt(
+    mode: str = Query(...),
+    user=Depends(require_user),
+):
+    """
+    GCS settings/qa_prompts/{mode}.json を返す
+    """
+    import json
+    from google.cloud import storage
+
+    bucket_name = os.getenv("GCS_BUCKET_NAME") or os.getenv("ANK_BUCKET_NAME")
+    if not bucket_name:
+        raise HTTPException(status_code=500, detail="GCS_BUCKET_NAME not set")
+
+    mode = mode.strip()
+    if not mode:
+        raise HTTPException(status_code=400, detail="mode required")
+
+    object_key = f"settings/qa_prompts/{mode}.json"
+
+    try:
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(object_key)
+
+        if not blob.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f"qa prompt not found: {object_key}",
+            )
+
+        text = blob.download_as_text(encoding="utf-8")
+        return json.loads(text)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
