@@ -10,7 +10,7 @@
 # - /v1/admin/dialogues と /v1/admin/dialogues/activate は、DB前提のため一旦 501 で無効化
 #   （importで落ちないことを優先）
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 import os
 import json
 import urllib.request
@@ -46,6 +46,40 @@ def _http_post_json(url: str, payload: dict, timeout_sec: int = 60) -> dict:
         url,
         data=data,
         headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            return _json_response(resp)
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        raise HTTPException(status_code=502, detail=f"failed to call knowledge: {e.code} {body}")
+    except urllib.error.URLError as e:
+        raise HTTPException(status_code=502, detail=f"failed to call knowledge: {e}")
+
+
+def _http_post_json2(url: str, payload: dict, timeout_sec: int = 60, headers: dict | None = None) -> dict:
+    """
+    knowledge 側に JSON を POST して、JSON を返す（ヘッダ転送対応）
+    - headers に Authorization 等を渡せる
+    """
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    h = {"Content-Type": "application/json"}
+    if headers:
+        # Content-Type は上書きさせない
+        for k, v in headers.items():
+            if k.lower() == "content-type":
+                continue
+            h[k] = v
+
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers=h,
         method="POST",
     )
     try:
@@ -235,6 +269,50 @@ def qa_generate_file(
         "knowledge": knowledge_body,
         "qa_file_object_key": qa_file_key,
     }
+
+@router.post("/v1/admin/dialogues/judge-method")
+def judge_method_proxy(
+    body: dict,
+    request: Request,
+    user=Depends(require_user),
+):
+    """
+    QA化チェック（素材判定→方式判定）の中継。
+    admin 側は判定ロジックを持たず、knowledge 側へ転送するだけ。
+
+    入力例：
+      {
+        "tenant_id": "ten_xxx",
+        "object_key": "tenants/.../uploads/.."
+      }
+
+    互換：
+      tenant_id の代わりに contract_id でも可。
+    """
+    knowledge_base = _get_knowledge_base_url()
+
+    tenant_id = (body.get("tenant_id") or body.get("contract_id") or "").strip()
+    object_key = (body.get("object_key") or "").strip()
+
+    if not tenant_id:
+        raise HTTPException(status_code=400, detail="tenant_id (or contract_id) required")
+    if not object_key:
+        raise HTTPException(status_code=400, detail="object_key required")
+
+    # Authorization を knowledge 側へ転送（knowledge 側も require_user を使う想定）
+    auth = request.headers.get("Authorization")
+    headers = {}
+    if auth:
+        headers["Authorization"] = auth
+
+    url = knowledge_base.rstrip("/") + "/v1/admin/dialogues/judge-method"
+    payload = {
+        "tenant_id": body.get("tenant_id"),
+        "contract_id": body.get("contract_id"),
+        "object_key": object_key,
+    }
+
+    return _http_post_json2(url, payload, timeout_sec=60, headers=headers)
 
 @router.get("/v1/admin/qa-prompt")
 def get_qa_prompt(
