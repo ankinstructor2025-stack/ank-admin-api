@@ -7,7 +7,6 @@ from app.routers.public import router as public_router
 from app.routers.contracts_admin import router as admin_core_router
 from app.routers.invites import router as invites_router
 from app.routers.uploads import router as uploads_router
-from app.routers.judge_method import router as judge_method_router
 from app.routers.admin_dialogues import router as admin_dialogues_router
 from app.routers.accounts import router as accounts_router
 from app.routers.tenants import router as tenants_router
@@ -33,7 +32,6 @@ def create_app() -> FastAPI:
     app.include_router(admin_core_router)
     app.include_router(invites_router)
     app.include_router(uploads_router)
-    app.include_router(judge_method_router)
     app.include_router(admin_dialogues_router)
     app.include_router(accounts_router)
     app.include_router(tenants_router)
