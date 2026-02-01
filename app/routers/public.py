@@ -12,7 +12,6 @@ from app.deps.auth import require_user
 router = APIRouter()
 _storage = storage.Client()
 
-
 # =========================
 # Common helpers
 # =========================
@@ -93,45 +92,41 @@ def _list_tenants(bucket, account_id: str) -> list[dict[str, Any]]:
 # =========================
 @router.get("/v1/session")
 def get_session(user=Depends(require_user)):
-    """
-    入口判定（DBなし）
-    - ログイン＝認証済み（uid/emailが取れている）
-    - アプリ内ユーザーは users/<uid>/user.json があるときだけ存在
-    - アカウントは 1ユーザー=1アカウント（acc_<uid>）で固定
-    - テナント一覧と、契約（テナント1:1）の有無を返す
-    """
-    email = (user.get("email") or "").strip()
-    uid = (user.get("uid") or "").strip()
+    uid = user["uid"]
 
-    if not uid:
-        raise HTTPException(status_code=400, detail="no uid in session")
-    if not email:
-        raise HTTPException(status_code=400, detail="no email in session")
+    # users/{uid}/user.json
+    user_json = read_json(f"users/{uid}/user.json")
+    if not user_json:
+        raise HTTPException(status_code=403, detail="user.json not found")
 
-    bucket = _bucket()
+    account_id = user_json.get("account_id")
+    if not account_id:
+        raise HTTPException(status_code=500, detail="account_id missing")
 
-    account_id = _account_id_for_uid(uid)
+    # users/{uid}/tenants/ は 1:1 前提
+    tenant_dirs = list_dirs(f"users/{uid}/tenants/")
+    if not tenant_dirs:
+        raise HTTPException(status_code=403, detail="tenant not found")
 
-    # アプリ内ユーザー（＝アカウント作成後に作る想定）
-    user_exists = _blob_exists(bucket, f"users/{uid}/user.json")
+    tenant_id = tenant_dirs[0]
 
-    # アカウント実体（accounts/<account_id>/account.json）
-    account_exists = _blob_exists(bucket, f"accounts/{account_id}/account.json")
+    # accounts/{account_id}/tenants/{tenant_id}/contract.json
+    contract = read_json(
+        f"accounts/{account_id}/tenants/{tenant_id}/contract.json"
+    )
+    if not contract:
+        raise HTTPException(status_code=403, detail="contract not found")
 
-    tenants: list[dict[str, Any]] = []
-    if account_exists:
-        tenants = _list_tenants(bucket, account_id)
+    plan_id = contract.get("plan_id")
+    if not plan_id:
+        raise HTTPException(status_code=500, detail="plan_id missing")
 
     return {
-        "authed": True,
         "uid": uid,
-        "email": email,
-        "user_exists": user_exists,
-        "account_id": account_id,           # ★ これがないと tenants 画面に渡せない
-        "account_exists": account_exists,   # ★ 入口分岐に使える
-        "tenants": tenants,                 # ★ tenantが無ければ tenants作成へ
+        "account_id": account_id,
+        "tenant_id": tenant_id,
+        "plan_id": plan_id,
     }
-
 
 @router.get("/v1/system")
 def system():
