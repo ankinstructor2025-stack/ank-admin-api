@@ -12,6 +12,7 @@ from app.deps.auth import require_user
 router = APIRouter()
 _storage = storage.Client()
 
+
 # =========================
 # Common helpers
 # =========================
@@ -92,40 +93,56 @@ def _list_tenants(bucket, account_id: str) -> list[dict[str, Any]]:
 # =========================
 @router.get("/v1/session")
 def get_session(user=Depends(require_user)):
-    uid = user["uid"]
+    email = (user.get("email") or "").strip()
+    uid = (user.get("uid") or "").strip()
 
-    # users/{uid}/user.json
-    user_json = read_json(f"users/{uid}/user.json")
-    if not user_json:
-        raise HTTPException(status_code=403, detail="user.json not found")
+    if not uid:
+        raise HTTPException(status_code=400, detail="no uid in session")
+    if not email:
+        raise HTTPException(status_code=400, detail="no email in session")
 
-    account_id = user_json.get("account_id")
-    if not account_id:
-        raise HTTPException(status_code=500, detail="account_id missing")
+    bucket = _bucket()
+    account_id = _account_id_for_uid(uid)
 
-    # users/{uid}/tenants/ は 1:1 前提
-    tenant_dirs = list_dirs(f"users/{uid}/tenants/")
-    if not tenant_dirs:
-        raise HTTPException(status_code=403, detail="tenant not found")
+    user_exists = _blob_exists(bucket, f"users/{uid}/user.json")
+    account_exists = _blob_exists(bucket, f"accounts/{account_id}/account.json")
 
-    tenant_id = tenant_dirs[0]
+    tenants: list[dict[str, Any]] = []
+    if account_exists:
+        tenants = _list_tenants(bucket, account_id)
 
-    # accounts/{account_id}/tenants/{tenant_id}/contract.json
-    contract = read_json(
-        f"accounts/{account_id}/tenants/{tenant_id}/contract.json"
-    )
-    if not contract:
-        raise HTTPException(status_code=403, detail="contract not found")
+    # ----------------------------
+    # ★ QA専用判定（正仕様）
+    # ----------------------------
+    tenant_id = None
+    qa_only = False
 
-    plan_id = contract.get("plan_id")
-    if not plan_id:
-        raise HTTPException(status_code=500, detail="plan_id missing")
+    if len(tenants) == 1:
+        tenant_id = tenants[0].get("tenant_id")
+
+        if tenant_id:
+            tenant_path = (
+                f"accounts/{account_id}/tenants/{tenant_id}/tenant.json"
+            )
+            if _blob_exists(bucket, tenant_path):
+                tenant = _read_json(bucket, tenant_path)
+                if isinstance(tenant, dict):
+                    qa_only = (tenant.get("plan_id") == "basic")
+
+    # ----------------------------
 
     return {
+        "authed": True,
         "uid": uid,
+        "email": email,
+        "user_exists": user_exists,
         "account_id": account_id,
+        "account_exists": account_exists,
+        "tenants": tenants,
+
+        # ★ UI判定用
         "tenant_id": tenant_id,
-        "plan_id": plan_id,
+        "qa_only": qa_only,
     }
 
 @router.get("/v1/system")
