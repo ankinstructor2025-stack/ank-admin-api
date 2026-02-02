@@ -43,33 +43,29 @@ def _account_id_for_uid(uid: str) -> str:
 
 
 def _list_tenants(bucket, account_id: str) -> list[dict[str, Any]]:
-    """
-    accounts/<account_id>/tenants/<tenant_id>/tenant.json を列挙して tenants を返す。
-    契約はテナント1:1なので、
-      accounts/<account_id>/tenants/<tenant_id>/contract.json の有無で has_contract を判定。
-    """
     prefix = f"accounts/{account_id}/tenants/"
     tenants: list[dict[str, Any]] = []
 
-    # tenant.json を手掛かりに tenant_id を拾う
-    for b in _storage.list_blobs(bucket, prefix=prefix):
+    # ★ bucket.list_blobs を使う（確実）
+    for b in bucket.list_blobs(prefix=prefix):
         if not b.name.endswith("/tenant.json"):
             continue
 
-        # accounts/<aid>/tenants/<tid>/tenant.json
         parts = b.name.split("/")
-        # ["accounts", aid, "tenants", tid, "tenant.json"]
         if len(parts) < 5:
             continue
-        tenant_id = parts[3]
 
-        # tenant.json を読む（壊れてたら最低限で返す）
+        # ★末尾から tenant_id を取る（堅牢）
+        tenant_id = parts[-2]
+
         name = ""
         status = ""
+        plan_id = ""
         try:
             data = json.loads(b.download_as_text(encoding="utf-8"))
             name = (data.get("name") or "").strip()
             status = (data.get("status") or "").strip()
+            plan_id = (data.get("plan_id") or "").strip()
         except Exception:
             pass
 
@@ -82,6 +78,9 @@ def _list_tenants(bucket, account_id: str) -> list[dict[str, Any]]:
                 "name": name,
                 "status": status,
                 "has_contract": has_contract,
+                # ※ session側で tenant.json を読み直すなら plan_id は不要
+                # ただ、qa_only判定を sessionでやるなら plan_id をここで持っててもよい
+                "plan_id": plan_id,
             }
         )
 
