@@ -113,7 +113,7 @@ def get_session(user=Depends(require_user)):
         tenants = _list_tenants(bucket, account_id)
 
     # ----------------------------
-    # ★ QA専用判定  
+    # ★ QA専用判定
     # ----------------------------
     tenant_id = None
     qa_only = False
