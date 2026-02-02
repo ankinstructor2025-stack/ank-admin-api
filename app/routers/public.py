@@ -107,6 +107,7 @@ def get_session(user=Depends(require_user)):
     user_exists = _blob_exists(bucket, f"users/{uid}/user.json")
     account_exists = _blob_exists(bucket, f"accounts/{account_id}/account.json")
 
+    print("furuuchi kiyoshi")
     tenants: list[dict[str, Any]] = []
     if account_exists:
         tenants = _list_tenants(bucket, account_id)
