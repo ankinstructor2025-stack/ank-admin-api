@@ -46,16 +46,23 @@ def _list_tenants(bucket, account_id: str) -> list[dict[str, Any]]:
     prefix = f"accounts/{account_id}/tenants/"
     tenants: list[dict[str, Any]] = []
 
-    # tenant.json を手掛かりに tenant_id を拾う
-    for b in bucket.list_blobs(prefix=prefix):  # ★ここだけ
+    print(f"[list_tenants] prefix={prefix}")
+
+    count = 0
+    for b in bucket.list_blobs(prefix=prefix):
+        count += 1
+        print(f"[list_tenants] blob={b.name}")
+
         if not b.name.endswith("/tenant.json"):
             continue
 
         parts = b.name.split("/")
         if len(parts) < 5:
+            print(f"[list_tenants] skip short parts={parts}")
             continue
 
-        tenant_id = parts[-2]  # ★ここだけ
+        tenant_id = parts[-2]
+        print(f"[list_tenants] tenant_id={tenant_id}")
 
         name = ""
         status = ""
@@ -63,22 +70,22 @@ def _list_tenants(bucket, account_id: str) -> list[dict[str, Any]]:
             data = json.loads(b.download_as_text(encoding="utf-8"))
             name = (data.get("name") or "").strip()
             status = (data.get("status") or "").strip()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[list_tenants] json error tenant_id={tenant_id} err={e}")
 
         contract_path = f"accounts/{account_id}/tenants/{tenant_id}/contract.json"
         has_contract = _blob_exists(bucket, contract_path)
 
-        tenants.append(
-            {
-                "tenant_id": tenant_id,
-                "name": name,
-                "status": status,
-                "has_contract": has_contract,
-            }
-        )
+        tenants.append({
+            "tenant_id": tenant_id,
+            "name": name,
+            "status": status,
+            "has_contract": has_contract,
+        })
 
+    print(f"[list_tenants] total_blobs={count} tenants_len={len(tenants)}")
     return tenants
+
 
 
 # =========================
