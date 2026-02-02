@@ -46,7 +46,7 @@ def _list_tenants(bucket, account_id: str) -> list[dict[str, Any]]:
     prefix = f"accounts/{account_id}/tenants/"
     tenants: list[dict[str, Any]] = []
 
-    # ★ bucket.list_blobs を使う（確実）
+    # ★ 正しい列挙
     for b in bucket.list_blobs(prefix=prefix):
         if not b.name.endswith("/tenant.json"):
             continue
@@ -55,34 +55,26 @@ def _list_tenants(bucket, account_id: str) -> list[dict[str, Any]]:
         if len(parts) < 5:
             continue
 
-        # ★末尾から tenant_id を取る（堅牢）
-        tenant_id = parts[-2]
+        tenant_id = parts[-2]  # ★ 安全
 
         name = ""
         status = ""
-        plan_id = ""
         try:
             data = json.loads(b.download_as_text(encoding="utf-8"))
             name = (data.get("name") or "").strip()
             status = (data.get("status") or "").strip()
-            plan_id = (data.get("plan_id") or "").strip()
         except Exception:
             pass
 
         contract_path = f"accounts/{account_id}/tenants/{tenant_id}/contract.json"
         has_contract = _blob_exists(bucket, contract_path)
 
-        tenants.append(
-            {
-                "tenant_id": tenant_id,
-                "name": name,
-                "status": status,
-                "has_contract": has_contract,
-                # ※ session側で tenant.json を読み直すなら plan_id は不要
-                # ただ、qa_only判定を sessionでやるなら plan_id をここで持っててもよい
-                "plan_id": plan_id,
-            }
-        )
+        tenants.append({
+            "tenant_id": tenant_id,
+            "name": name,
+            "status": status,
+            "has_contract": has_contract,
+        })
 
     return tenants
 
