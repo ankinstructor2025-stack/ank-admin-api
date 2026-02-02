@@ -46,8 +46,8 @@ def _list_tenants(bucket, account_id: str) -> list[dict[str, Any]]:
     prefix = f"accounts/{account_id}/tenants/"
     tenants: list[dict[str, Any]] = []
 
-    # ★ 正しい列挙
-    for b in bucket.list_blobs(prefix=prefix):
+    # tenant.json を手掛かりに tenant_id を拾う
+    for b in bucket.list_blobs(prefix=prefix):  # ★ここだけ
         if not b.name.endswith("/tenant.json"):
             continue
 
@@ -55,7 +55,7 @@ def _list_tenants(bucket, account_id: str) -> list[dict[str, Any]]:
         if len(parts) < 5:
             continue
 
-        tenant_id = parts[-2]  # ★ 安全
+        tenant_id = parts[-2]  # ★ここだけ
 
         name = ""
         status = ""
@@ -69,12 +69,14 @@ def _list_tenants(bucket, account_id: str) -> list[dict[str, Any]]:
         contract_path = f"accounts/{account_id}/tenants/{tenant_id}/contract.json"
         has_contract = _blob_exists(bucket, contract_path)
 
-        tenants.append({
-            "tenant_id": tenant_id,
-            "name": name,
-            "status": status,
-            "has_contract": has_contract,
-        })
+        tenants.append(
+            {
+                "tenant_id": tenant_id,
+                "name": name,
+                "status": status,
+                "has_contract": has_contract,
+            }
+        )
 
     return tenants
 
