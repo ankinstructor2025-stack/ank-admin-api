@@ -139,11 +139,9 @@ def get_session(user=Depends(require_user)):
         "user_exists": user_exists,
         "account_id": account_id,
         "account_exists": account_exists,
-        "tenants": tenants,
-
-        # ★ UI判定用
         "tenant_id": tenant_id,
         "qa_only": qa_only,
+        "tenants": tenants,
     }
 
 @router.get("/v1/system")
